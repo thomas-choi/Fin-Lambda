@@ -9,6 +9,7 @@ def listDir(dir):
     namelist = [ f.name for f in os.scandir(dir) if f.is_dir() ]
     print('Sub-Directories: ', namelist)
     subfolders = [ f.path for f in os.scandir(dir) if f.is_dir() ]
+    print('Sub-Path: ', subfolders)
     for folder in subfolders:
         print(folder)
 

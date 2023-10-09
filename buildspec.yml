@@ -4,15 +4,11 @@ phases:
     runtime-versions:
       python: 3.8
     commands:
-      - echo "Installing dependencies..."
-      - pip install -r requirements.txt -t lib
+      - echo "No Installation anymore...."
   build:
     commands:
       - echo "Zipping deployment package..."
-      - cd lib
-      - zip -r9 ../deployment_package.zip .
-      - cd ..
-      - zip -g deployment_package.zip lambda_function.py
+      - zip -r9 deployment_package.zip lambda_function.py
   post_build:
     commands:
       - echo "Updating lambda Function..."

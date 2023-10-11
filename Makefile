@@ -39,7 +39,10 @@ myFinDataFull.zip:
 	zip -r9 $@ python/
 
 configure.zip: 
-	zip -r9 $@ configure/
+	$(RM) -rf ./python
+	mv ./configure ./python
+	zip -r9 $@ python/
+	mv ./python ./configure
 
 clean:
 	$(RM) -rf ./python configure.zip myFinDataFull.zip

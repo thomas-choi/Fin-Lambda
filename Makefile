@@ -31,18 +31,12 @@ else
 	VDEPS  = @echo "  DEPENDS $@" && $(CXX) -MM
 endif
 
-all: myFinDataFull.zip configure.zip
+all: myFinDataFull.zip 
 
 myFinDataFull.zip: 
 	$(RM) -rf ./python
 	pip3 install -r requirements.txt -t python/lib/python3.8/site-packages
 	zip -r9 $@ python/
-
-configure.zip: 
-	$(RM) -rf ./python
-	mv ./configure ./python
-	zip -r9 $@ python/
-	mv ./python ./configure
 
 clean:
 	$(RM) -rf ./python configure.zip myFinDataFull.zip

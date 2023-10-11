@@ -11,9 +11,9 @@ def listDir(dir):
     subfolders = [ f.path for f in os.scandir(dir) if f.is_dir() ]
     print('Sub-Path: ', subfolders)
     for folder in subfolders:
-        print(folder)
+        listDir(folder)
 
-def lambda_handler(event, context):
+def env_display():
     d = {'col1': [1,2], 'col2': [3,4]}
     df = pd.DataFrame(data = d)
     print(df)
@@ -21,3 +21,7 @@ def lambda_handler(event, context):
     current_working_directory = os.getcwd()
     listDir(current_working_directory)
     listDir('/opt')
+
+
+def lambda_handler(event, context):
+    env_display()

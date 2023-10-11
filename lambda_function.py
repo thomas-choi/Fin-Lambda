@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import eod_usrate as UR
 
 def listDir(dir, level=50):
     if level > 0:
@@ -25,3 +26,4 @@ def env_display():
 
 def lambda_handler(event, context):
     env_display()
+    UR.eod_usrate_main()

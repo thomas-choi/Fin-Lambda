@@ -14,4 +14,4 @@ API_KEY=""
 VENDOR='yfinance'
 FIRSTTRAINDTE="2010/01/01"
 LASTTRAINDATE="2021/10/19"
-PROD_LIST_DIR="../Product_List"
+PROD_LIST_DIR="./configure/Product_List"

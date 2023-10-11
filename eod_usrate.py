@@ -41,8 +41,8 @@ nInstruments=['Federal_funds', 'CP',
 
 
 
-if __name__ == '__main__':
-    load_dotenv("./Prod_config/Stk_eodfetch_DO.env") #Check path for env variables
+def eod_usrate_main():
+    load_dotenv("./configure/Prod_config/Stk_eodfetch.py") #Check path for env variables
     # logging.basicConfig(filename=f'logging/eod_USrates_{datetime.today().date()}.log', filemode='a', format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
     logging.getLogger().setLevel(logging.DEBUG)
 

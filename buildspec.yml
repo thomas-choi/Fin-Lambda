@@ -12,5 +12,5 @@ phases:
   post_build:
     commands:
       - echo "Updating lambda Function..."
-      - aws lambda update-function-code --function-name arn:aws:lambda:us-east-2:567575054547:function:myFinData --zip-file fileb://deployment_package.zip
+      - aws lambda update-function-code --function-name myFinData --zip-file fileb://deployment_package.zip
       - echo "DONE!!"

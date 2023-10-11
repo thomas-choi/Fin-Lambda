@@ -22,8 +22,7 @@ def env_display():
     listDir(current_working_directory)
     listDir('/opt', level=4)
     print(df)
-    print('Done x2.2')
+    print('Done x2.3')
 
 def lambda_handler(event, context):
     env_display()
-    UR.eod_usrate_main()

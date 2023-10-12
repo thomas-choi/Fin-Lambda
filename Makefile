@@ -35,13 +35,13 @@ all: myFinDataFull.zip config.zip
 
 myFinDataFull.zip: 
 	$(RM) -rf ./python
-	pip3 install -r requirements.txt -t python/lib/python3.8/site-packages
+	/home/thomas/env/Py3.10-fin-lambda/bin/pip3 install -r requirements.txt -t python/lib/python3.10/site-packages
 	zip -r9 $@ python/
 
 config.zip:
 	zip -r9 $@ configure/
 
 clean:
-	$(RM) -rf ./python configure.zip myFinDataFull.zip
+	$(RM) -rf ./python config.zip myFinDataFull.zip
 
 .PHONY: all clean

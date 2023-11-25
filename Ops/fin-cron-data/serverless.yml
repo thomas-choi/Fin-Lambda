@@ -1,0 +1,38 @@
+service: fin-cron-data
+
+# configValidationMode: error
+
+frameworkVersion: '3'
+useDotenv: true
+
+plugins:
+  - serverless-dotenv-plugin
+  
+provider:
+  name: aws
+  runtime: python3.10
+  region: us-east-2
+  profile: ServerLessUser
+  timeout: 120     # default is 6 sec
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - 'S3:PutObject'
+            - 'S3:GetObject'
+            - 'S3:DeleteObject'
+          Resource: "arn:aws:s3:::workingplace/*"
+        - Effect: Allow
+          Action: 'S3:ListBucket'
+          Resource: "arn:aws:s3:::workingplace"
+
+functions:
+  cronHandler:
+    handler: handler.run
+    events:
+      # Invoke Lambda function every 2nd minute from Mon-Fri
+      # - schedule: cron(0/15 13-21 ? * MON-FRI *)
+      - schedule: cron(0/10 13-21 ? * MON-FRI *)
+      - schedule: cron(0/10 21-00 ? * MON-FRI *)
+        # enabled: true

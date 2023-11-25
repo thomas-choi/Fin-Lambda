@@ -6,35 +6,39 @@ import dataUtil as DU
 import json
 from os import environ
 import pandas as pd
+import sys
+import pytz
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+load_dotenv() 
 
 localrun = False
 
 def getOptions(ticker, PnC, strike, expiration):
-    print('getOptions:', ticker, PnC, strike, expiration)
     exp_dt = datetime.strptime(expiration, "%Y-%m-%d")
     today = date.today()
-    logging.debug(f'-->getOptions({ticker},{PnC},{strike},{expiration},{exp_dt},{today})')
+    logging.info(f'-->getOptions({ticker},{PnC},{strike},{expiration},{exp_dt},{today})')
     op_price = None
+    pclose = -0.001
     if (today > exp_dt.date()):
         logging.error(f'  expiration: {exp_dt} is old\n')
-        return None
+        return pclose, op_price
     
     asset = yf.Ticker(ticker)
     histdata = asset.history()
     if len(histdata)>0:
-        pclose = asset.history().iloc[-1].Close
+        # logging.info(f'asset.history: {histdata}')
+        pclose = histdata.iloc[-1].Close
         pclose = float("{:.2f}".format(pclose))
         try:
             opts = asset.option_chain(expiration)
             if PnC == 'P':
                 op = opts.puts[opts.puts['strike'] == strike]
-                # print(opts.puts)
+                # print(op)
             else:
                 op = opts.calls[opts.calls['strike'] == strike]
-                # print(opts.calls)
+                # print(op)
             if len(op)>0:
                 opt = op.head(1).reset_index()
                 op_price = op.iloc[0]
@@ -42,15 +46,11 @@ def getOptions(ticker, PnC, strike, expiration):
                 logging.error(f'{ticker} {strike}{PnC} not found\n')
         except Exception as error:
             logging.error(error)
-    return op_price
+    return pclose, op_price
 
 def run(event, context):
-    logging.debug("In handler.run()\n")
-    current_time = datetime.now()
-    timestr = str(current_time)
-    logger.info("Your cron function handler.run " + " ran at " + timestr)
-
-    load_dotenv("Prod_config/Stk_eodfetch.env") 
+    ny_time = datetime.now().astimezone( pytz.timezone('US/Eastern'))
+    logging.info(f"Current opt_handler: NY Time: {ny_time}")
 
     opt_cols = ["Symbol","PnC","Strike","Expiration"]
     opt_df = pd.DataFrame(columns=opt_cols)
@@ -68,29 +68,44 @@ def run(event, context):
     print(df.info())
     for ix, row in df.iterrows():
         opt_df.loc[len(opt_df)] = [row.Symbol, row.PnC, row.H_Strike, row.Expiration]
-    print(opt_df.info())
+        
+    def keyformat(sym, pnc, strike, expire):
+        return f'{sym}-{pnc}-{strike:.2f}-{expire}'
+    
+    print(opt_df)
+    opt_df['KEY'] = opt_df.apply(lambda row: keyformat(row['Symbol'],row['PnC'],
+                                               row['Strike'],row['Expiration']), axis=1)
+    opt_df.sort_values(by=['Symbol','PnC','Strike','Expiration'], inplace=True)
+    dup_values = opt_df['KEY'].duplicated()
+    print(opt_df[dup_values])
+    print("============")
+    opt_df = opt_df[~dup_values]
     if localrun:
         opt_df.to_csv("options_list.csv", index=False)
-
+        
     options_columns=opt_cols + ["contractSymbol", "lastTradeDate","strike","lastPrice","bid","ask","change","percentChange",
-                     "volume","openInterest","impliedVolatility","inTheMoney","contractSize","currency"]
+                     "volume","openInterest","impliedVolatility","inTheMoney","contractSize","currency", "PClose", "timestamp"]
     snapshots = pd.DataFrame(columns=options_columns)
     for ix, row in opt_df.iterrows():
-        options = getOptions(row.Symbol, row.PnC, row.Strike, row.Expiration)
-        # print(options)
+        pclose, options = getOptions(row.Symbol, row.PnC, row.Strike, row.Expiration)
+        # print('option price:  ', options)
         if options is not None:
-            print(options.tolist())
-            snapshots.loc[len(snapshots)] = [row.Symbol, row.PnC, row.Strike, row.Expiration] + options.tolist()
+            opt_values = options.tolist()
+            logging.info(opt_values)
+            snapshots.loc[len(snapshots)] = [row.Symbol, row.PnC, row.Strike, row.Expiration] + opt_values + [pclose, ny_time]
 
     DBMKTDATA=environ.get("DBMKTDATA")
     TBLSNAPSHOOT="options_snapshot"
-    snapshots = snapshots[opt_cols + ["lastPrice","bid","ask","change","percentChange","volume","openInterest","impliedVolatility","inTheMoney","contractSize","currency"]]
+    snapshots = snapshots[opt_cols + ["lastPrice","bid","ask","change","percentChange","volume","openInterest","impliedVolatility",
+                                      "inTheMoney","contractSize","currency","PClose",'timestamp']]
+    print(snapshots)
     if localrun:
         snapshots.to_csv(f"{TBLSNAPSHOOT}.csv", index=False)
-    print(snapshots)
-    DU.ExecSQL(f"DELETE FROM {DBMKTDATA}.{TBLSNAPSHOOT} where (Symbol != \'1\');")
-    DU.StoreEOD(snapshots, DBMKTDATA, TBLSNAPSHOOT)
+    else:
+        DU.ExecSQL(f"DELETE FROM {DBMKTDATA}.{TBLSNAPSHOOT} where (Symbol != \'1\');")
+        DU.StoreEOD(snapshots, DBMKTDATA, TBLSNAPSHOOT)
 
 if __name__ == '__main__':
+    # logging.basicConfig(filename="opt_handler.log", encoding='utf-8', level=logging.DEBUG)
     localrun = True
     run(0, 0)

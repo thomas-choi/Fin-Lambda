@@ -36,3 +36,7 @@ functions:
       - schedule: cron(0/10 13-21 ? * MON-FRI *)
       - schedule: cron(0/10 21-00 ? * MON-FRI *)
         # enabled: true
+  fffHandler:
+    handler: fff_handler.run
+    events:
+      - schedule: cron(0 0 1 * ? *)    

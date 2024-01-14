@@ -31,11 +31,39 @@ else
 	VDEPS  = @echo "  DEPENDS $@" && $(CXX) -MM
 endif
 
-all: myFinDataFull.zip config.zip
+all: finWebLib.zip finSvrLib.zip finVisLib.zip finSvr2Lib.zip finDataLib.zip finCron.zip config.zip
 
-myFinDataFull.zip: 
+ldaShell:
+	docker build -t mylambda .
+
+finCron.zip: 
 	$(RM) -rf ./python
-	/home/thomas/env/Py3.10-fin-lambda/bin/pip3 install -r requirements.txt -t python/lib/python3.10/site-packages
+	pip3 install -r Ops/fin-cron-data/requirements_cron.txt -t python/lib/python3.10/site-packages
+	zip -r9 $@ python/
+
+finWebLib.zip: 
+	$(RM) -rf ./python
+	pip3 install -r req_Web.txt -t python/lib/python3.10/site-packages
+	zip -r9 $@ python/
+
+finSvrLib.zip: 
+	$(RM) -rf ./python
+	pip3 install -r req_Server.txt -t python/lib/python3.10/site-packages
+	zip -r9 $@ python/
+
+finSvr2Lib.zip: 
+	$(RM) -rf ./python
+	pip3 install -r req_Server2.txt -t python/lib/python3.10/site-packages
+	zip -r9 $@ python/
+
+finVisLib.zip: 
+	$(RM) -rf ./python
+	pip3 install -r req_Visual.txt -t python/lib/python3.10/site-packages
+	zip -r9 $@ python/
+
+finDataLib.zip: 
+	$(RM) -rf ./python
+	pip3 install -r req_Data.txt -t python/lib/python3.10/site-packages
 	zip -r9 $@ python/
 
 config.zip:

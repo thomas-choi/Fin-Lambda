@@ -1,0 +1,7 @@
+Django==4.1
+django-crispy-forms==1.14.0
+crispy-bootstrap4
+django-utils-six==2.0
+djangorestframework==3.13.1
+requests==2.29.0
+urllib3==1.26.16

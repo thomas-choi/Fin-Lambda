@@ -40,3 +40,7 @@ functions:
     handler: fff_handler.run
     events:
       - schedule: cron(0 0 1 * ? *)    
+  usrateHandler:
+    handler: usrate_handler.run
+    events:
+      - schedule: cron(1 21 ? * MON-FRI *)    

@@ -32,7 +32,8 @@ def stk_run(event, context):
     # StockList = ['AMD','BAC','C','CSCO','DIS','DKNG','KO','MSFT','MU','NVDA','OXY','PYPL','TFC','TSLA','UBER','USB','VZ','WFC','XOM']
     # StockList = ['IBM']
     # list_N = ["stock_list", "etf_list", "crypto_list", "us-cn_stock_list"]
-    list_N = ["full_list"]          # tge combined list from the above symbol list files.
+    # list_N = ["full_list"]          # tge combined list from the above symbol list files.
+    list_N = ["system"]              # get symbol lists from the system database
     # list_N = ["test_list"]
     defaultIP=environ.get("defaultIP")
     defaultPort=int(environ.get("defaultPort"))
@@ -84,7 +85,7 @@ def run(event, context):
 
 if __name__ == '__main__':
     # logging.basicConfig(filename="handler.log", encoding='utf-8')
-    localrun = False
+    localrun = True
     OPT.localrun=True
     event={"test":"true"}
     run(event, 0)

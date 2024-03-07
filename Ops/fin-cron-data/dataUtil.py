@@ -199,11 +199,20 @@ def load_eod_price(ticker, start, end):
     query = f"SELECT * from {DB}.{TBL} where symbol = \'{ticker}\' and Date >= \'{start}\' and Date <= \'{end}\' order by Date;"
     return load_df_SQL(query)
 
+def load_symbols_db():
+    df = load_df_SQL(f'call GlobalMarketData.current_symbols_V1;')
+    symbol_list = np.sort(df.Symbol.unique())
+    logging.debug(f'{symbol_list}')
+    return symbol_list
+
 def load_symbols(symlistName):
     """
     # Return list of stock symbols.
     """
 
+    if symlistName == "system":
+        return load_symbols_db()
+    
     PROD_LIST_DIR = environ.get("PROD_LIST_DIR")
     logging.debug(f"PROD_LIST_DIR is \'{PROD_LIST_DIR}\'")
     logging.debug(f"load_symbols({symlistName})")

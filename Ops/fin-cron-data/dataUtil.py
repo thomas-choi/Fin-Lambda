@@ -204,8 +204,9 @@ def load_symbols(symlistName):
     # Return list of stock symbols.
     """
 
-    # PROD_LIST_DIR = environ.get("PROD_LIST_DIR")
-    PROD_LIST_DIR = "Product_List"
+    PROD_LIST_DIR = environ.get("PROD_LIST_DIR")
+    logging.debug(f"PROD_LIST_DIR is \'{PROD_LIST_DIR}\'")
+    logging.debug(f"load_symbols({symlistName})")
     try:
         fpath = os.path.join(PROD_LIST_DIR, f'{symlistName}.csv')
         logging.info(f'Fetch symbols from {fpath}')

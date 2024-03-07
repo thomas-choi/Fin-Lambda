@@ -4,3 +4,6 @@ pandas==1.5.3
 SQLAlchemy==1.4.46
 yfinance==0.2.4
 getFamaFrenchFactors
+polygon
+polygon-api-client
+interactive-broker-python-web-api

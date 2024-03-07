@@ -22,13 +22,17 @@ localrun = False
 testing = False
 
 def stk_run(event, context):
-    current_time = datetime.now()
-    timestr = str(current_time)
-    logger.info("Your cron function handler.stk_run " + " ran at " + timestr)
+    if "NYTIME" in event:
+        current_time = event["NYTIME"]
+    else:
+        current_time = datetime.now().strftime("-%Y/%m/%d-%H:%M:%S")
+    current_time = current_time.strftime("-%Y/%m/%d-%H:%M:%S")
+    logger.info("Your cron function handler.stk_run " + " ran at " + current_time)
 
     # StockList = ['AMD','BAC','C','CSCO','DIS','DKNG','KO','MSFT','MU','NVDA','OXY','PYPL','TFC','TSLA','UBER','USB','VZ','WFC','XOM']
     # StockList = ['IBM']
-    list_N = ["stock_list", "etf_list", "crypto_list", "us-cn_stock_list"]
+    # list_N = ["stock_list", "etf_list", "crypto_list", "us-cn_stock_list"]
+    list_N = ["full_list"]          # tge combined list from the above symbol list files.
     # list_N = ["test_list"]
     defaultIP=environ.get("defaultIP")
     defaultPort=int(environ.get("defaultPort"))
@@ -40,16 +44,17 @@ def stk_run(event, context):
         logger.info(f'Process {lt} with {symbol_list}')
         for sy in symbol_list:   
             reply = DDSServer.snapshot(sy, TBLmap)
-            # print('reply : ', reply)
-            logging.info(reply.keys())
-            logging.info(reply.values())
+            logging.info('reply : ', reply)
+            # logging.info(reply.keys())
+            # logging.info(reply.values())
             market.loc[len(market), reply.keys()] = reply.values()
     del DDSServer
     DBheaders = ['Symbol','open','high','low','last','volume','bid','bidvol','ask','askvol','pclose','name','timestamp']
     market = market[DBheaders].dropna(axis=0, how='any')
-    print(market.info)
-    print(market.head(2))
-    print(market.tail(2))
+    market['timestamp'] = market['timestamp'] + current_time
+    logging.info(market.info)
+    logging.info(market.head(2))
+    logging.info(market.tail(2))
     DBMKTDATA=environ.get("DBMKTDATA")
     TBLSNAPSHOOT="snapshot"
     if localrun:
@@ -59,24 +64,27 @@ def stk_run(event, context):
         DU.StoreEOD(market, DBMKTDATA, TBLSNAPSHOOT)
 
 def run(event, context):
+    logging.info(f"** ==> handler.run(event: {event}, context: {context}")
     # Get the current time in New York
-    logging.info("** ==> run(event: {event}, context: {context}")
     ny_time = datetime.now().astimezone( pytz.timezone('US/Eastern'))
     logging.info(f"Current NY Time: {ny_time}")
+    event["NYTIME"] = ny_time
     # Check if the current time is after 9:30 AM and before 4 PM
     if ny_time.time() >= datetime.strptime('09:30', '%H:%M').time() and ny_time.time() < datetime.strptime('16:00', '%H:%M').time():
         logging.info('The current time is between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
-        OPT.run(event, context)
+        #  Cannot run opt_snapshot data from yfinance, use IB from local
+        # OPT.run(event, context)       
     else:
         logging.info('The current time is not between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
-        if "test" in event:
-            OPT.run(event, context)
+        #  Cannot run opt_snapshot data from yfinance, use IB from local
+        # if "test" in event:
+        #     OPT.run(event, context)
 
 if __name__ == '__main__':
     # logging.basicConfig(filename="handler.log", encoding='utf-8')
-    localrun = True
+    localrun = False
     OPT.localrun=True
     event={"test":"true"}
     run(event, 0)

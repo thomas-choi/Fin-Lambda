@@ -26,13 +26,17 @@ def getOptions(ticker, PnC, strike, expiration):
         return pclose, op_price
     
     asset = yf.Ticker(ticker)
+
     histdata = asset.history()
     if len(histdata)>0:
-        # logging.info(f'asset.history: {histdata}')
+        # logging.info(f'asset.history:\n {histdata}')
         pclose = histdata.iloc[-1].Close
         pclose = float("{:.2f}".format(pclose))
+        ex_dates = asset.options
+        logging.info(f'  {ticker}.Options expiration dates is {ex_dates}')
         try:
             opts = asset.option_chain(expiration)
+            logging.info(f' opts found:\n {opts}')
             if PnC == 'P':
                 op = opts.puts[opts.puts['strike'] == strike]
                 # print(op)
@@ -49,6 +53,7 @@ def getOptions(ticker, PnC, strike, expiration):
     return pclose, op_price
 
 def run(event, context):
+    logging.info(f"** ==> opt_handler.run(event: {event}, context: {context})")
     ny_time = datetime.now().astimezone( pytz.timezone('US/Eastern'))
     logging.info(f"Current opt_handler: NY Time: {ny_time}")
 
@@ -72,7 +77,7 @@ def run(event, context):
     def keyformat(sym, pnc, strike, expire):
         return f'{sym}-{pnc}-{strike:.2f}-{expire}'
     
-    print(opt_df)
+    # print(opt_df)
     opt_df['KEY'] = opt_df.apply(lambda row: keyformat(row['Symbol'],row['PnC'],
                                                row['Strike'],row['Expiration']), axis=1)
     opt_df.sort_values(by=['Symbol','PnC','Strike','Expiration'], inplace=True)
@@ -89,6 +94,7 @@ def run(event, context):
     for ix, row in opt_df.iterrows():
         pclose, options = getOptions(row.Symbol, row.PnC, row.Strike, row.Expiration)
         # print('option price:  ', options)
+        # assume short options, therefore use bid price
         if options is not None:
             opt_values = options.tolist()
             logging.info(opt_values)
@@ -107,5 +113,5 @@ def run(event, context):
 
 if __name__ == '__main__':
     # logging.basicConfig(filename="opt_handler.log", encoding='utf-8', level=logging.DEBUG)
-    localrun = True
+    localrun = False
     run(0, 0)

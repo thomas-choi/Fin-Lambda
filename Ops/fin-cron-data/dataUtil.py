@@ -200,7 +200,8 @@ def load_eod_price(ticker, start, end):
     return load_df_SQL(query)
 
 def load_symbols_db():
-    df = load_df_SQL(f'call GlobalMarketData.current_symbols_V1;')
+    # df = load_df_SQL(f'call GlobalMarketData.current_symbols_V1;')
+    df = load_df_SQL(f'call GlobalMarketData.current_symbols_V2;')
     symbol_list = np.sort(df.Symbol.unique())
     logging.debug(f'{symbol_list}')
     return symbol_list

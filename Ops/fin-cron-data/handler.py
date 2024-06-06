@@ -75,16 +75,16 @@ def run(event, context):
         logging.info('The current time is between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
         #  Cannot run opt_snapshot data from yfinance, use IB from local
-        # OPT.run(event, context)       
+        OPT.run(event, context)       
     else:
         logging.info('The current time is not between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
         #  Cannot run opt_snapshot data from yfinance, use IB from local
-        # if "test" in event:
-        #     OPT.run(event, context)
+        if "test" in event:
+            OPT.run(event, context)
 
 if __name__ == '__main__':
-    # logging.basicConfig(filename="handler.log", encoding='utf-8')
+    logging.basicConfig(filename="handler.log", encoding='utf-8')
     localrun = True
     OPT.localrun=True
     event={"test":"true"}

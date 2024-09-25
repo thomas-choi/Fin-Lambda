@@ -8,6 +8,7 @@ from os import environ
 import pandas as pd
 import sys
 import pytz
+from FOC_data import retreive_options
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -34,9 +35,10 @@ def getOptions(ticker, PnC, strike, expiration):
         pclose = float("{:.2f}".format(pclose))
         ex_dates = asset.options
         logging.info(f'  {ticker}.Options expiration dates is {ex_dates}')
+        OptDataEngine = environ.get("OptDataEngine")
         try:
             opts = asset.option_chain(expiration)
-            logging.info(f' opts found:\n {opts}')
+            logging.info(' opts found:\n')
             if PnC == 'P':
                 op = opts.puts[opts.puts['strike'] == strike]
                 # print(op)
@@ -48,6 +50,9 @@ def getOptions(ticker, PnC, strike, expiration):
                 op_price = op.iloc[0]
             else:
                 logging.error(f'{ticker} {strike}{PnC} not found\n')
+                if OptDataEngine == "FOC":
+                    op_price, ts = retreive_options(ticker, expiration, PnC, strike)
+                
         except Exception as error:
             logging.error(error)
     return pclose, op_price
@@ -96,6 +101,7 @@ def run(event, context):
         # print('option price:  ', options)
         # assume short options, therefore use bid price
         if options is not None:
+            print(f"** pclose:{pclose}, opt:", options)
             opt_values = options.tolist()
             logging.info(opt_values)
             snapshots.loc[len(snapshots)] = [row.Symbol, row.PnC, row.Strike, row.Expiration] + opt_values + [pclose, ny_time]
@@ -113,5 +119,5 @@ def run(event, context):
 
 if __name__ == '__main__':
     # logging.basicConfig(filename="opt_handler.log", encoding='utf-8', level=logging.DEBUG)
-    localrun = False
+    localrun = True
     run(0, 0)

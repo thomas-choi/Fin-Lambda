@@ -110,7 +110,15 @@ def run(event, context):
     TBLSNAPSHOOT="options_snapshot"
     snapshots = snapshots[opt_cols + ["lastPrice","bid","ask","change","percentChange","volume","openInterest","impliedVolatility",
                                       "inTheMoney","contractSize","currency","PClose",'timestamp']]
-    print(snapshots)
+
+    snapshots['lastPrice'] = snapshots['lastPrice'].astype(float)
+    snapshots['bid'] = snapshots['bid'].astype(float)
+    snapshots['ask'] = snapshots['ask'].astype(float)
+    snapshots['volume'] = snapshots['volume'].astype(float)
+    snapshots['openInterest'] = snapshots['openInterest'].astype(float)
+    snapshots['impliedVolatility'] = snapshots['impliedVolatility'].astype(float)
+    snapshots['PClose'] = snapshots['PClose'].astype(float)
+    print(snapshots.info())
     if localrun:
         snapshots.to_csv(f"{TBLSNAPSHOOT}.csv", index=False)
     else:
@@ -119,5 +127,5 @@ def run(event, context):
 
 if __name__ == '__main__':
     # logging.basicConfig(filename="opt_handler.log", encoding='utf-8', level=logging.DEBUG)
-    localrun = True
+    localrun = False
     run(0, 0)

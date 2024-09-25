@@ -23,14 +23,14 @@ def retreive_options(ticker, expiration, pc, strike):
         opt["contractSymbol"] = data['contract_symbol']
         opt["lastTradeDate"] = ""
         opt["strike"] = strike
-        opt["lastPrice"] = data['Last Sale']
-        opt["bid"] = data['Bid']
-        opt["ask"] = data['Ask']
+        opt["lastPrice"] = "0" if data['Last Sale'] == "N/A" else data['Last Sale']
+        opt["bid"] = "0" if data['Bid'] == "N/A" else data['Bid']
+        opt["ask"] = "0" if data['Ask'] == "N/A" else data['Ask'] 
         opt["change"] = 0
         opt["percentChange"] = 0
-        opt["volume"] = data['Volume']
-        opt["openInterest"] = data['Open Interest']
-        opt["impliedVolatility"] = data['Impvol']
+        opt["volume"] = "0" if data['Volume'] == "N/A" else data['Volume']
+        opt["openInterest"] = "0" if data['Open Interest'] == "N/A" else data['Open Interest'] 
+        opt["impliedVolatility"] = "0" if data['Impvol'] == "N/A" else data['Impvol'] 
         opt["inTheMoney"] = ""
         opt["contractSize"] = 'REGULAR'
         opt["currency"] = "USD"
@@ -56,7 +56,7 @@ if __name__ == '__main__':
     print(ct)
     print('timestamp: ', ts)
 
-    ct, ts = retreive_options("SLV", '2024-09-30','C', 25)
+    ct, ts = retreive_options("KO", '2024-10-18','P', 67)
     print(ct)
     print('timestamp: ', ts)
 

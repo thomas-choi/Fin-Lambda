@@ -85,7 +85,7 @@ def run(event, context):
 
 if __name__ == '__main__':
     logging.basicConfig(filename="handler.log", encoding='utf-8')
-    localrun = True
-    OPT.localrun=True
+    localrun = False
+    OPT.localrun=False
     event={"test":"true"}
     run(event, 0)

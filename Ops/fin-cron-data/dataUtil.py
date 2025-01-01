@@ -173,7 +173,6 @@ def load_df(stock_symbol=None, DailyMode=True, lastdt=None, startdt=None, dataMo
 
 def StoreEOD(eoddata, DBn, TBLn):
     try:
-        eoddata.head(3)
         logging.info(f'StoreEOD size: {len(eoddata)} in table:{TBLn} on DB:{DBn}')
         dbcon = get_DBengine()
         logging.info(f'StoreEOD dbcon: {dbcon}')
@@ -199,20 +198,23 @@ def load_eod_price(ticker, start, end):
     query = f"SELECT * from {DB}.{TBL} where symbol = \'{ticker}\' and Date >= \'{start}\' and Date <= \'{end}\' order by Date;"
     return load_df_SQL(query)
 
-def load_symbols_db():
-    # df = load_df_SQL(f'call GlobalMarketData.current_symbols_V1;')
-    df = load_df_SQL(f'call GlobalMarketData.current_symbols_V2;')
-    symbol_list = np.sort(df.Symbol.unique())
+def load_symbols_db(ver="V2"):
+    sql=f"call GlobalMarketData.current_symbols_{ver}"
+    logging.info(f"load_symbol_db({sql})")
+    df = load_df_SQL(sql)
+    # symbol_list = df.Symbol.to_list()
+    # logging.debug(symbol_list)
+    symbol_list = sorted(df.Symbol.unique())
     logging.debug(f'{symbol_list}')
     return symbol_list
 
-def load_symbols(symlistName):
+def load_symbols(symlistName, ver="V2"):
     """
     # Return list of stock symbols.
     """
 
     if symlistName == "system":
-        return load_symbols_db()
+        return load_symbols_db(ver)
     
     PROD_LIST_DIR = environ.get("PROD_LIST_DIR")
     logging.debug(f"PROD_LIST_DIR is \'{PROD_LIST_DIR}\'")

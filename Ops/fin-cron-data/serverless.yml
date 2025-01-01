@@ -35,6 +35,12 @@ functions:
       # - schedule: cron(0/15 13-21 ? * MON-FRI *)
       - schedule: cron(0/10 13-21 ? * MON-FRI *)
       - schedule: cron(0/10 21-00 ? * MON-FRI *)
+  yfinHandler:
+    handler: yfin_handler.run
+    events:
+      # Invoke Lambda function every HKT 9:30 am from Mon-Fri
+      - schedule: cron(0/10 1-21 ? * MON-FRI *)
+      # - schedule: cron(0/10 21-00 ? * MON-FRI *)
         # enabled: true
   fffHandler:
     handler: fff_handler.run

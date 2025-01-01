@@ -41,10 +41,8 @@ def getOptions(ticker, PnC, strike, expiration):
             logging.info(' opts found:\n')
             if PnC == 'P':
                 op = opts.puts[opts.puts['strike'] == strike]
-                # print(op)
             else:
                 op = opts.calls[opts.calls['strike'] == strike]
-                # print(op)
             if len(op)>0:
                 opt = op.head(1).reset_index()
                 op_price = op.iloc[0]
@@ -68,27 +66,26 @@ def run(event, context):
     df = DU.load_df_SQL(f'call Trading.sp_stock_trades_V3;')
     df['Date'] = df['Date'].astype(str)
     df['Expiration'] = df['Expiration'].astype(str)
-    print(df.head(2))
+    logging.debug(df.head(2))
     for ix, row in df.iterrows():
         opt_df.loc[len(opt_df)] = [row.Symbol, row.PnC, row.Strike, row.Expiration]
     df = DU.load_df_SQL(f'call Trading.sp_etf_trades_v2;')
     df['Date'] = df['Date'].astype(str)
     df['Expiration'] = df['Expiration'].astype(str)
-    print(df.head(2))
-    print(df.info())
+    logging.debug(df.head(2))
+    logging.debug(df.info())
     for ix, row in df.iterrows():
         opt_df.loc[len(opt_df)] = [row.Symbol, row.PnC, row.H_Strike, row.Expiration]
         
     def keyformat(sym, pnc, strike, expire):
         return f'{sym}-{pnc}-{strike:.2f}-{expire}'
     
-    # print(opt_df)
     opt_df['KEY'] = opt_df.apply(lambda row: keyformat(row['Symbol'],row['PnC'],
                                                row['Strike'],row['Expiration']), axis=1)
     opt_df.sort_values(by=['Symbol','PnC','Strike','Expiration'], inplace=True)
     dup_values = opt_df['KEY'].duplicated()
-    print(opt_df[dup_values])
-    print("============")
+    logging.debug(opt_df[dup_values])
+    logging.debug("============")
     opt_df = opt_df[~dup_values]
     if localrun:
         opt_df.to_csv("options_list.csv", index=False)
@@ -98,12 +95,11 @@ def run(event, context):
     snapshots = pd.DataFrame(columns=options_columns)
     for ix, row in opt_df.iterrows():
         pclose, options = getOptions(row.Symbol, row.PnC, row.Strike, row.Expiration)
-        # print('option price:  ', options)
         # assume short options, therefore use bid price
         if options is not None:
-            print(f"** pclose:{pclose}, opt:", options)
+            logging.debug(f"** pclose:{pclose}, opt:", options)
             opt_values = options.tolist()
-            logging.info(opt_values)
+            logging.debug(opt_values)
             snapshots.loc[len(snapshots)] = [row.Symbol, row.PnC, row.Strike, row.Expiration] + opt_values + [pclose, ny_time]
 
     DBMKTDATA=environ.get("DBMKTDATA")
@@ -118,7 +114,6 @@ def run(event, context):
     snapshots['openInterest'] = snapshots['openInterest'].astype(float)
     snapshots['impliedVolatility'] = snapshots['impliedVolatility'].astype(float)
     snapshots['PClose'] = snapshots['PClose'].astype(float)
-    print(snapshots.info())
     if localrun:
         snapshots.to_csv(f"{TBLSNAPSHOOT}.csv", index=False)
     else:

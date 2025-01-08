@@ -50,3 +50,7 @@ functions:
     handler: usrate_handler.run
     events:
       - schedule: cron(1 21 ? * MON-FRI *)    
+  FXrateHandler:
+    handler: fx_handler.run
+    events:
+      - schedule: cron(0 0-23 ? * SUN-SAT *)    

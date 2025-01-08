@@ -113,7 +113,7 @@ def stk_run(event, context):
     if len(difference)>0:
         logging.error(f"{len(difference)} of symbols has no data: {difference}")
     DBMKTDATA=environ.get("DBMKTDATA")
-    TBLSNAPSHOOT="snapshot"
+    TBLSNAPSHOOT=environ.get("TBLSNAPSHOOT")
     if localrun:
         market.to_csv(f"{TBLSNAPSHOOT}.csv", index=False)
     else:

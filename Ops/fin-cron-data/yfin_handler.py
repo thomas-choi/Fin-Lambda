@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import dataUtil as DU
 from os import environ
 import pandas as pd
-import opt_handler as OPT
+# import opt_handler as OPT
 from datetime import datetime, timezone, timedelta
 import pytz
 import yfinance as yf
@@ -130,17 +130,17 @@ def run(event, context):
     if ny_time.time() >= datetime.strptime('09:30', '%H:%M').time() and ny_time.time() < datetime.strptime('16:00', '%H:%M').time():
         logging.info('The current time is between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
-        OPT.run(event, context)       
+        # OPT.run(event, context)       
     else:
         logging.info('The current time is not between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
-        if "test" in event:
-            OPT.run(event, context)
+        # if "test" in event:
+        #     OPT.run(event, context)
 
 if __name__ == '__main__':
     # logging.basicConfig(filename="yfin_handler.log", encoding='utf-8')
     localrun = False
     testing = False
-    OPT.localrun=localrun
+    # OPT.localrun=localrun
     event={"test":"true"}
     run(event, 0)

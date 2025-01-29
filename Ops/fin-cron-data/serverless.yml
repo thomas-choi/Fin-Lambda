@@ -35,13 +35,16 @@ functions:
       # - schedule: cron(0/15 13-21 ? * MON-FRI *)
       - schedule: cron(0/10 13-21 ? * MON-FRI *)
       - schedule: cron(0/10 21-00 ? * MON-FRI *)
+  optHandler:
+    handler: opt_handler.run
+    events:
+      # Invoke Lambda function NYT 9:30-4:00 pm from Fri
+      - schedule: cron(0/10 12-21 ? * MON-FRI *)
   yfinHandler:
     handler: yfin_handler.run
     events:
-      # Invoke Lambda function every HKT 9:30 am from Mon-Fri
-      - schedule: cron(0/10 1-21 ? * MON-FRI *)
-      # - schedule: cron(0/10 21-00 ? * MON-FRI *)
-        # enabled: true
+      # Invoke Lambda function every HKT 9:30 am from Mon to US Friday close
+      - schedule: cron(0/10 1-22 ? * MON-FRI *)
   fffHandler:
     handler: fff_handler.run
     events:
@@ -54,3 +57,7 @@ functions:
     handler: fx_handler.run
     events:
       - schedule: cron(0 0-23 ? * SUN-SAT *)    
+  FXHistHandler:
+    handler: fxeod_handler.run
+    events:
+      - schedule: cron(10 21 ? * SUN-SAT *)    

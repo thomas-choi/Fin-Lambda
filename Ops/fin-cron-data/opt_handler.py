@@ -22,37 +22,45 @@ def getOptions(ticker, PnC, strike, expiration):
     logging.info(f'-->getOptions({ticker},{PnC},{strike},{expiration},{exp_dt},{today})')
     op_price = None
     pclose = -0.001
+    OptDataEngine = environ.get("OptDataEngine")
     if (today > exp_dt.date()):
         logging.error(f'  expiration: {exp_dt} is old\n')
         return pclose, op_price
     
-    asset = yf.Ticker(ticker)
+    try:
+        asset = yf.Ticker(ticker)
 
-    histdata = asset.history()
-    if len(histdata)>0:
-        # logging.info(f'asset.history:\n {histdata}')
-        pclose = histdata.iloc[-1].Close
-        pclose = float("{:.2f}".format(pclose))
-        ex_dates = asset.options
-        logging.info(f'  {ticker}.Options expiration dates is {ex_dates}')
-        OptDataEngine = environ.get("OptDataEngine")
-        try:
-            opts = asset.option_chain(expiration)
-            logging.info(' opts found:\n')
-            if PnC == 'P':
-                op = opts.puts[opts.puts['strike'] == strike]
-            else:
-                op = opts.calls[opts.calls['strike'] == strike]
-            if len(op)>0:
-                opt = op.head(1).reset_index()
-                op_price = op.iloc[0]
-            else:
-                logging.error(f'{ticker} {strike}{PnC} not found\n')
-                if OptDataEngine == "FOC":
-                    op_price, ts = retreive_options(ticker, expiration, PnC, strike)
-                
-        except Exception as error:
-            logging.error(error)
+        histdata = asset.history()
+
+        if len(histdata)>0:
+            # logging.info(f'asset.history:\n {histdata}')
+            pclose = histdata.iloc[-1].Close
+            pclose = float("{:.2f}".format(pclose))
+            logging.debug(f"pclose is {pclose}")
+            ex_dates = asset.options
+            logging.info(f'  {ticker}.Options expiration dates is {ex_dates}')
+            try:
+                opts = asset.option_chain(expiration)
+                logging.info(' opts found:\n')
+                if PnC == 'P':
+                    op = opts.puts[opts.puts['strike'] == strike]
+                else:
+                    op = opts.calls[opts.calls['strike'] == strike]
+                if len(op)>0:
+                    opt = op.head(1).reset_index()
+                    op_price = op.iloc[0]
+                    
+            except Exception as error:
+                logging.error(f"option-chains: {error}")
+    except Exception as error:
+        logging.error(f"yf_ticker: {error}")
+
+    if op_price is None:
+        logging.error(f'{ticker} {strike}-{PnC} not found\n')
+        if OptDataEngine == "FOC":
+            op_price, ts = retreive_options(ticker, expiration, PnC, strike)
+
+    logging.info("-->getOptions() return")
     return pclose, op_price
 
 def run(event, context):

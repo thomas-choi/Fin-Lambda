@@ -1,11 +1,13 @@
 from FOC import FOC
 import pandas as pd
+import logging
 
 #create instance
 ref_FOC = FOC()
 
 def retreive_options(ticker, expiration, pc, strike):
     #fetch current stock price for AAPL
+    logging.info(f"retreive_options FOC: {ticker}, {expiration}, {pc}, {strike}")
     if pc == "P":
         pc = "PUT"
     elif pc == "C":
@@ -15,7 +17,7 @@ def retreive_options(ticker, expiration, pc, strike):
 
     try:
         contract_symbol = ref_FOC.get_contract_symbol(ticker, expiration, pc, strike)
-        print("FOC.contract_symbol: ", contract_symbol)
+        logging.debug("FOC.contract_symbol: ", contract_symbol)
         options_contract = ref_FOC.get_options_price_data(contract_symbol)
         data = options_contract.iloc[0].to_dict()
         print(data)
@@ -48,15 +50,15 @@ def retreive_options(ticker, expiration, pc, strike):
 # options_contract = ref_FOC.get_options_price_data(contract_symbol)
 
 if __name__ == '__main__':
-    ct, ts = retreive_options("XOM", '2024-10-18','P',111)
+    ct, ts = retreive_options("TSLA", '2025-02-21','P',190)
     print(ct)
     print('timestamp: ', ts)
 
-    ct, ts = retreive_options("AMD", '2024-10-18','P',152.5)
+    ct, ts = retreive_options("XOP", '2025-03-21','C',138.5)
     print(ct)
     print('timestamp: ', ts)
 
-    ct, ts = retreive_options("KO", '2024-10-18','P', 67)
+    ct, ts = retreive_options("XOP", '2025-03-21','P',75.0)
     print(ct)
     print('timestamp: ', ts)
 

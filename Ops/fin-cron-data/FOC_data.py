@@ -17,10 +17,10 @@ def retreive_options(ticker, expiration, pc, strike):
 
     try:
         contract_symbol = ref_FOC.get_contract_symbol(ticker, expiration, pc, strike)
-        logging.debug("FOC.contract_symbol: ", contract_symbol)
+        logging.debug(f"FOC.contract_symbol: {contract_symbol}")
         options_contract = ref_FOC.get_options_price_data(contract_symbol)
         data = options_contract.iloc[0].to_dict()
-        print(data)
+        logging.debug(f"FOC.data = {data}")
         opt={}
         opt["contractSymbol"] = data['contract_symbol']
         opt["lastTradeDate"] = ""
@@ -39,7 +39,7 @@ def retreive_options(ticker, expiration, pc, strike):
         opt_rec = pd.Series(opt)
         ts = data["timestamp"]
     except Exception as error:
-        print(error)
+        logging.error(f"FOC.retreive({error})")
         opt_rec = None
         ts = None
 
@@ -50,15 +50,15 @@ def retreive_options(ticker, expiration, pc, strike):
 # options_contract = ref_FOC.get_options_price_data(contract_symbol)
 
 if __name__ == '__main__':
-    ct, ts = retreive_options("TSLA", '2025-02-21','P',190)
+    ct, ts = retreive_options("DBA", '2025-03-21','P',190)
     print(ct)
     print('timestamp: ', ts)
 
-    ct, ts = retreive_options("XOP", '2025-03-21','C',138.5)
+    ct, ts = retreive_options("AAPL", '2025-03-21','P', 250)
     print(ct)
     print('timestamp: ', ts)
 
-    ct, ts = retreive_options("XOP", '2025-03-21','P',75.0)
+    ct, ts = retreive_options("XOP", '2025-03-21','P', 135)
     print(ct)
     print('timestamp: ', ts)
 

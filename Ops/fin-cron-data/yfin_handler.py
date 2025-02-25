@@ -96,10 +96,15 @@ def stk_run(event, context):
         num_s = len(symbol_list)
         logger.info(f'Process \'{lt}\' with {num_s} of  {symbol_list}')
         for sy in symbol_list:
-            stock = yf.Ticker(sy)
-            record = record_info(stock.info)
-            if record is not None:
-                records.append(record)
+            try:
+                stock = yf.Ticker(sy)
+                record = record_info(stock.info)
+                if record is not None:
+                    records.append(record)
+
+            except Exception as error:
+                logging.error(f"yf_ticker: {error}")
+
     DBheaders = ['Symbol','open','high','low','last','volume','bid','bidvol','ask','askvol','pclose','name','timestamp','quoteType']
     market = pd.DataFrame(records)
     market['timestamp'] = current_time
@@ -138,7 +143,7 @@ def run(event, context):
         #     OPT.run(event, context)
 
 if __name__ == '__main__':
-    # logging.basicConfig(filename="yfin_handler.log", encoding='utf-8')
+    # logging.basicConfig(filename="yfin_handler.log", encoding='utf-8', level=logging.DEBUG)
     localrun = False
     testing = False
     # OPT.localrun=localrun

@@ -3,9 +3,9 @@ python-dotenv==0.21.1
 # pandas==1.5.3
 pandas<2.2
 SQLAlchemy==1.4.46
-yfinance==0.2.37
-getFamaFrenchFactors
-freeoptionschain
+yfinance
+# getFamaFrenchFactors
+# freeoptionschain
 # polygon
 # polygon-api-client
 # interactive-broker-python-web-api

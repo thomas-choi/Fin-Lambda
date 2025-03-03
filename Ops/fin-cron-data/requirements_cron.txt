@@ -3,7 +3,7 @@ python-dotenv==0.21.1
 # pandas==1.5.3
 pandas<2.2
 SQLAlchemy==1.4.46
-yfinance
+yfinance==0.2.54
 # getFamaFrenchFactors
 # freeoptionschain
 # polygon

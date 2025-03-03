@@ -12,13 +12,11 @@ import ast
 
 # Create logger
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)  # Set the logger to handle DEBUG level messages
 
 load_dotenv() 
     
 
 localrun = False
-testing = False
 
 # Function to fetch the latest exchange rates for multiple tickers
 def fetch_exchange_rates(tickers, base):
@@ -66,6 +64,11 @@ def fx_run(event, context):
         DU.StoreEOD(fx_df, DBMKTDATA, TBLFXSNAPSHOT)
 
 def run(event, context):
+    if ('test' in event):
+        logger.setLevel(logging.DEBUG)  # Set the logger to handle DEBUG level messages
+    else:
+        logger.setLevel(logging.INFO)  # Set the logger to handle DEBUG level messages
+
     logging.info(f"** ==> fx_handler.run(event: {event}, context: {context}")
     # Get the current time in New York
     ny_time = datetime.datetime.now().astimezone( pytz.timezone('US/Eastern'))
@@ -74,7 +77,6 @@ def run(event, context):
     fx_run(event, context)     
 
 if __name__ == '__main__':
-    localrun = False
-    testing = False
-    event={"test":"true"}
+    localrun = True
+    event={"test": "True"}
     run(event, 0)

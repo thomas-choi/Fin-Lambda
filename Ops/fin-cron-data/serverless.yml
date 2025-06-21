@@ -44,7 +44,17 @@ functions:
     handler: yfin_handler.run
     events:
       # Invoke Lambda function every HKT 9:30 am from Mon to US Friday close
-      - schedule: cron(0/10 1-22 ? * MON-FRI *)
+      - schedule: cron(0/0 1-22 ? * MON-FRI *)
+  yfus30minEOD:
+    handler: eoddata_minhandler_us.run
+    events:
+      # Invoke Lambda function every night 
+      - schedule: cron(05 00 ? * TUE-SAT *)   
+  yfasia30minEOD:
+    handler: eoddata_minhandler_asia.run
+    events:
+      # Invoke Lambda function every night 
+      - schedule: cron(00 10 ? * MON-FRI *)   
   fffHandler:
     handler: fff_handler.run
     events:

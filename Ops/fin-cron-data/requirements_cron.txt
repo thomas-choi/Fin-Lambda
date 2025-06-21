@@ -1,11 +1,6 @@
 PyMySQL==1.0.2
 python-dotenv==0.21.1
-# pandas==1.5.3
-pandas<2.2
 SQLAlchemy==1.4.46
-yfinance==0.2.54
-# getFamaFrenchFactors
-# freeoptionschain
-# polygon
-# polygon-api-client
-# interactive-broker-python-web-api
+yfinance==0.2.58
+pandas==1.5.3
+numpy==1.26.4

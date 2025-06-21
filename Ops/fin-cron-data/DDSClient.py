@@ -1,5 +1,6 @@
 import socket
 from os import environ
+import logging
 
 DDSmap = {'33': 'timestamp', '4':'4', '146':'146', '37':'high', '133':'open','32':'low', '3':'last',
           '0':'ticker','73':'spread_code','22':'22','23':'currency', '21':'name','505':'ch-name',
@@ -63,6 +64,7 @@ class TCPClient:
     
     def snapshot(self, ticker, mymap = DDSmap):
         cmd = f'open|{ticker}|{ticker}|mode|image|\n'
+        logging.debug(f"snapshot:({cmd})")
         reply = self.send_command_b(cmd)
         return self.convertRecord(reply, mymap)
     

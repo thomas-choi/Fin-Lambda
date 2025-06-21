@@ -45,6 +45,20 @@ def get_DBengine():
         logging.info(f'dbconn=>{dbconn}')
     return dbconn
 
+def get_Max_datetime(dbntable, symbol=None):
+    try:
+        if symbol is None:
+            query = f"SELECT max(Datetime) as maxdate from {dbntable} ;"
+        else:
+            query = "SELECT max(Datetime) as maxdate from {} where symbol = \'{}\';".format(dbntable, symbol)
+        logging.info(f'get_Max_datetime :{query}')
+        df = pd.read_sql(query, get_DBengine())
+        max_date = df.maxdate.iloc[0]
+        logging.info(f"get_Max_datetime() => {max_date} ")
+        return max_date
+    except Exception as e:
+        logging.error("Exception occurred at get_Max_datetime()", exc_info=True)
+
 def get_Max_date(dbntable, symbol=None):
     try:
         if symbol is None:
@@ -239,10 +253,29 @@ def load_symbols_dict():
     except Exception as e:
         logging.error("Exception occurred at load_symbols_dict()", exc_info=True)
 
+def load_exchange_tz():
+    # Return list of stock symbols.
+
+    PROD_LIST_DIR = environ.get("PROD_LIST_DIR")
+    try:
+        tz_list = pd.read_csv(os.path.join(PROD_LIST_DIR, "Exchange_timezone.csv"))
+        return dict(tz_list.values)
+    except Exception as e:
+        logging.error("Exception occurred at load_symbols_dict()", exc_info=True)
+
 def get_Last_Date_by_Sym(tblname, sym):
     FIRSTTRAINDTE = datetime.strptime(environ.get("FIRSTTRAINDTE"), "%Y/%m/%d").date()
 
     mktdate = get_Max_date(tblname, sym)
+    lastdt = FIRSTTRAINDTE
+    if mktdate is not None:
+        lastdt = mktdate + timedelta(days=1)
+    return lastdt
+
+def get_Last_Datetime_by_Sym(tblname, sym):
+    FIRSTTRAINDTE = datetime.strptime(environ.get("FIRSTTRAINDTE"), "%Y/%m/%d")
+
+    mktdate = get_Max_datetime(tblname, sym)
     lastdt = FIRSTTRAINDTE
     if mktdate is not None:
         lastdt = mktdate + timedelta(days=1)

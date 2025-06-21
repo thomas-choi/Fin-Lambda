@@ -5,29 +5,28 @@ from dotenv import load_dotenv
 import dataUtil as DU
 from os import environ
 import pandas as pd
-# import opt_handler as OPT
 from datetime import datetime, timezone, timedelta
 import pytz
 import yfinance as yf
 import sys
 
-# Create logger
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)  # Set the logger to handle DEBUG level messages
-
-# Create handler for logging to stdout
-# handler = logging.StreamHandler(sys.stdout)
-# handler.setLevel(logging.DEBUG)  # Ensure the handler captures DEBUG level messages
-
+# Load environment variables from .env file
 load_dotenv() 
-    
+
+DEBUG=environ.get("DEBUG")
+print(f"DEBUG is {DEBUG}")
+if DEBUG == "debug":
+    logging.basicConfig(level=logging.DEBUG)
+    print("Logging is DEBUG.")
+else:
+    logging.basicConfig(level=logging.INFO)
+    print("Logging is INFO.")
+logger = logging.getLogger(__name__)
+
 TBLmap = {'33': 'timestamp', '37':'high', '133':'open','32':'low', '3':'last',
           '0':'Symbol','21':'name',
            '31':'pclose', '30':'30', '127':'close',
           '17':'volume', '1':'bid', '16':'bidvol', '2':'ask', '19':'askvol'}
-
-localrun = False
-testing = False
 
 def record_info(rec):
     try:
@@ -78,6 +77,12 @@ def record_info(rec):
         return None
 
 def stk_run(event, context):
+    localrun = False
+    testing = False
+    if "localrun" in event:
+        localrun = event["localrun"]
+    if "testing" in event:
+        testing = event["testing"]
     if "NYTIME" in event:
         current_time = event["NYTIME"]
     else:
@@ -126,6 +131,7 @@ def stk_run(event, context):
         DU.StoreEOD(market, DBMKTDATA, TBLSNAPSHOOT)
 
 def run(event, context):
+
     logging.info(f"** ==> yfin_handler.run(event: {event}, context: {context}")
     # Get the current time in New York
     ny_time = datetime.now().astimezone( pytz.timezone('US/Eastern'))
@@ -134,18 +140,12 @@ def run(event, context):
     # Check if the current time is after 9:30 AM and before 4 PM
     if ny_time.time() >= datetime.strptime('09:30', '%H:%M').time() and ny_time.time() < datetime.strptime('16:00', '%H:%M').time():
         logging.info('The current time is between 9:30 AM and 4 PM in New York time.')
-        stk_run(event, context)
-        # OPT.run(event, context)       
+        stk_run(event, context)     
     else:
         logging.info('The current time is not between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
-        # if "test" in event:
-        #     OPT.run(event, context)
 
 if __name__ == '__main__':
-    # logging.basicConfig(filename="yfin_handler.log", encoding='utf-8', level=logging.DEBUG)
-    localrun = False
-    testing = False
-    # OPT.localrun=localrun
-    event={"test":"true"}
+    # For local testing, set the event and context
+    event={"localrun":False,"testing":False}
     run(event, 0)

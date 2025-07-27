@@ -18,7 +18,6 @@ DEBUG=environ.get("DEBUG")
 if DEBUG == "debug":
     logger.setLevel(logging.DEBUG)
     print("Logging is DEBUG.")
-localrun = False
 
 def getOptions(ticker, PnC, strike, expiration):
     logging.info(f'-->getOptions({ticker},{PnC},{strike},{expiration})')
@@ -61,7 +60,12 @@ def getOptions(ticker, PnC, strike, expiration):
     return pclose, op_price
 
 def run(event, context):
-    global localrun
+    localrun = False
+    testing = False
+    if "localrun" in event:
+        localrun = event["localrun"]
+    if "testing" in event:
+        testing = event["testing"]
 
     # logging.info(f"** ==> opt_handler.run(event: {event}, context: {context})")
     ny_time = datetime.now().astimezone( pytz.timezone('US/Eastern'))
@@ -151,10 +155,6 @@ def run(event, context):
         DU.StoreEOD(snapshots, DBMKTDATA, TBLSNAPSHOOT)
 
 if __name__ == '__main__':
-    LOCALRUN = environ.get("LOCALRUN")
-    if LOCALRUN == "localrun":
-        localrun = True
-        logging.basicConfig(filename="opt_handler.log", encoding='utf-8', level=logging.DEBUG)
-        print("Set localrun True")
-    # run({'test':1}, 0)
-    run({}, 0)
+    # For local testing, set the event and context
+    event={"localrun":False,"testing":False}
+    run(event, 0)

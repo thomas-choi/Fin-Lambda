@@ -131,6 +131,7 @@ env.bak/
 venv.bak/
 venv-cron/
 venv-cron?/
+venv-*/
 
 # Spyder project settings
 .spyderproject

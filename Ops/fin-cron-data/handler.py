@@ -5,13 +5,16 @@ from dotenv import load_dotenv
 import dataUtil as DU
 from os import environ
 import pandas as pd
-import opt_handler as OPT
 from datetime import datetime, timezone, timedelta
 import pytz
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 load_dotenv() 
+DEBUG=environ.get("DEBUG")
+if DEBUG == "debug":
+    logger.setLevel(logging.DEBUG)
+    print("Logging is DEBUG.")
     
 TBLmap = {'33': 'timestamp', '37':'high', '133':'open','32':'low', '3':'last',
           '0':'Symbol','21':'name',
@@ -22,6 +25,8 @@ localrun = False
 testing = False
 
 def stk_run(event, context):
+    global localrun
+
     if "NYTIME" in event:
         current_time = event["NYTIME"]
     else:
@@ -75,17 +80,17 @@ def run(event, context):
         logging.info('The current time is between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
         #  Cannot run opt_snapshot data from yfinance, use IB from local
-        OPT.run(event, context)       
+        # OPT.run(event, context)       
     else:
         logging.info('The current time is not between 9:30 AM and 4 PM in New York time.')
         stk_run(event, context)
-        #  Cannot run opt_snapshot data from yfinance, use IB from local
-        if "test" in event:
-            OPT.run(event, context)
 
 if __name__ == '__main__':
-    logging.basicConfig(filename="handler.log", encoding='utf-8')
-    localrun = False
-    OPT.localrun=False
+    LOCALRUN = environ.get("LOCALRUN")
+    if LOCALRUN == "localrun":
+        localrun = True
+        logging.basicConfig(filename="handler.log", encoding='utf-8')
+        print("Set localrun True")
+    OPT.localrun=localrun
     event={"test":"true"}
     run(event, 0)

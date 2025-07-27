@@ -21,11 +21,16 @@ provider:
           Action:
             - 'S3:PutObject'
             - 'S3:GetObject'
+            - 's3:HeadObject'  # Add this
             - 'S3:DeleteObject'
-          Resource: "arn:aws:s3:::workingplace/*"
+          Resource: 
+            - "arn:aws:s3:::workingplace/*"
+            - "arn:aws:s3:::fin-modal-data/*"
         - Effect: Allow
           Action: 'S3:ListBucket'
-          Resource: "arn:aws:s3:::workingplace"
+          Resource: 
+            - "arn:aws:s3:::workingplace"
+            - "arn:aws:s3:::fin-modal-data"
 
 functions:
   cronHandler:
@@ -71,3 +76,7 @@ functions:
     handler: fxeod_handler.run
     events:
       - schedule: cron(10 21 ? * SUN-SAT *)    
+  yfNewshandler:
+    handler: yf-news-collect.run
+    events:
+      - schedule: cron(1 * * * ? *) # 11:30 pm EDT (UTC-4) every day

@@ -34,6 +34,7 @@ provider:
 
 functions:
   cronHandler:
+      # Stock snapshot data handler
     handler: handler.run
     events:
       # Invoke Lambda function every 2nd minute from Mon-Fri
@@ -41,38 +42,45 @@ functions:
       - schedule: cron(0/10 13-21 ? * MON-FRI *)
       - schedule: cron(0/10 21-00 ? * MON-FRI *)
   optHandler:
+      # Options snapshot data handler
     handler: opt_handler.run
     events:
       # Invoke Lambda function NYT 9:30-4:00 pm from Fri
       - schedule: cron(0/10 12-21 ? * MON-FRI *)
-  yfinHandler:
-    handler: yfin_handler.run
-    events:
-      # Invoke Lambda function every HKT 9:30 am from Mon to US Friday close
-      - schedule: cron(0/0 1-22 ? * MON-FRI *)
+  # yfinHandler:
+  #   handler: yfin_handler.run
+  #   events:
+  #     # Invoke Lambda function every HKT 9:30 am from Mon to US Friday close
+  #     - schedule: cron(0/0 1-22 ? * MON-FRI *)
   yfus30minEOD:
+      # Download US market EOD for 30 minutes interval data handler
     handler: eoddata_minhandler_us.run
     events:
       # Invoke Lambda function every night 
       - schedule: cron(05 00 ? * TUE-SAT *)   
   yfasia30minEOD:
+      # Download Asia market EOD for 30 minutes interval data handler
     handler: eoddata_minhandler_asia.run
     events:
       # Invoke Lambda function every night 
       - schedule: cron(00 10 ? * MON-FRI *)   
   fffHandler:
+      # Fama French Factor data handler
     handler: fff_handler.run
     events:
       - schedule: cron(0 0 1 * ? *)    
   usrateHandler:
+      # US Interest Rate data handler
     handler: usrate_handler.run
     events:
       - schedule: cron(1 21 ? * MON-FRI *)    
   FXrateHandler:
+      # FX Rate snapshot data handler
     handler: fx_handler.run
     events:
       - schedule: cron(0 0-23 ? * SUN-SAT *)    
   FXHistHandler:
+      # FX daily EOD data handler
     handler: fxeod_handler.run
     events:
       - schedule: cron(10 21 ? * SUN-SAT *)    

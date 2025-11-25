@@ -24,10 +24,10 @@ def fetch_exchange_rates(start_dt, end_dt, tickers, base):
     data = {}
     for ticker in tickers:
         try:
-            ddf = yf.download(ticker, start=start_dt, end=end_dt, auto_adjust=False)
+            ddf = yf.download(ticker, start=start_dt, end=end_dt, auto_adjust=False, multi_level_index=False)
             if len(ddf)>0:
-                ddf.columns = [col[0] for col in ddf.columns]
-                # logging.debug(f'Reshape column of {ticker} to {ddf.head(2)}')
+                # ddf.columns = [col[0] for col in ddf.columns]
+                logging.debug(f'Reshape column of {ticker} to {ddf.head(2)}')
                 ddf['base_cur'] = base
                 ddf['target_cur'] = ticker.split('=')[0]
                 data[ticker] = ddf[cols]
@@ -46,7 +46,7 @@ def fx_run(event, context):
     if "NYTIME" in event:
         current_time = event["NYTIME"]
     else:
-        current_time = datetime.now().strftime("%Y/%m/%d-%H:%M:%S")
+        current_time = datetime.now()
     mToday = current_time.date()
     today5PM = current_time.replace(hour=17, minute=0, second=0, microsecond=0)
     if current_time < today5PM:

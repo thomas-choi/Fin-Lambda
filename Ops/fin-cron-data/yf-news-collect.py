@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 """
-yf-collect.py
+yf-new-collect.py
 
-Fetches:
- 1) News (old-style fetch_news / save_news_items)
- 2) Quarterly Financials via yfinance API
- 3) Quarterly Key Statistics via yfinance API
-
-Default tickers: from DEFAULT_TICKERS env var (path to CSV with 'Symbol' column)
-Skips re‑saving any JSON that already exists for today.
-Logs the latest quarter for Fin & Stats.
-Only fetches Financials & Statistics on quarterly start dates (Jan 1, Apr 1, Jul 1, Oct 1).
-Supports DEBUG flag in .env to enable debug logging.
-Supports LOCALRUN flag in .env to save to local folder (True) or AWS S3 (False).
-Tracks ticker processing progress in a JSON file on S3 or locally.
+Same functionality as yf-news-collect.py but supports Cloudflare R2 (S3-compatible)
+storage via environment variables R2_ENDPOINT, R2_ACCESS_KEY_ID and
+R2_SECRET_ACCESS_KEY. If R2_ENDPOINT is present, the boto3 S3 client will be
+configured to use that endpoint with the provided keys. Otherwise falls back to
+regular AWS S3 behavior.
 """
 import os
 import re
@@ -39,12 +32,17 @@ SOURCE          = 'yfinance'
 DEFAULT_TICKERS = os.getenv('DEFAULT_TICKERS', '')
 S3_BUCKET       = os.getenv('S3_BUCKET', '')
 LOCALRUN        = os.getenv('LOCALRUN', 'True').lower() in ('true', '1', 'yes')
-BATCH_SIZE      = int(os.getenv('BATCH_SIZE', '20'))  # Number of tickers to process per Lambda invocation
+BATCH_SIZE      = int(os.getenv('BATCH_SIZE', '25'))  # Number of tickers to process per Lambda invocation
+
+# R2-specific envs (optional)
+R2_ENDPOINT = os.getenv('R2_ENDPOINT')
+R2_ACCESS_KEY_ID = os.getenv('R2_ACCESS_KEY_ID')
+R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY')
 
 # Init logger
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s [yf-collect] %(message)s'
+    format='%(asctime)s %(levelname)s [yf-collect-r2] %(message)s'
 )
 logger = logging.getLogger()
 
@@ -55,15 +53,27 @@ if DEBUG.lower() == "debug":
     logging.debug('Debug logging enabled')
 else:
     logger.setLevel(logging.INFO)
-    logging.info('Info logging enabled')  
+    logging.info('Info logging enabled')
 
-# Initialize S3 client if not running locally
+# Initialize S3/R2 client if not running locally
 if not LOCALRUN:
     if not S3_BUCKET:
         logging.error("S3_BUCKET environment variable is required when LOCALRUN is False")
         raise ValueError("S3_BUCKET not set")
-    s3_client = boto3.client('s3')
-    logging.info(f"Configured to save to S3 bucket: {S3_BUCKET}")
+    # If R2 endpoint is provided, configure boto3 client to point to it and
+    # use the provided access keys. Cloudflare R2 is S3-compatible.
+    if R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        )
+        logging.info(f"Configured to save to R2 bucket: {S3_BUCKET} (endpoint: {R2_ENDPOINT})")
+    else:
+        # Fall back to standard AWS S3 client (will use default credentials)
+        s3_client = boto3.client('s3')
+        logging.info(f"Configured to save to S3 bucket: {S3_BUCKET}")
 else:
     logging.info("Configured to save to local directory")
 
@@ -98,7 +108,7 @@ def save_s3_json(obj, s3_key):
         Body=json_data.encode('utf-8'),
         ContentType='application/json'
     )
-    logging.info(f"Saved to S3: {s3_key}")
+    logging.info(f"Saved to S3/R2: {s3_key}")
     
 def save_json(path: str, obj, overwrite: bool = False):
     if LOCALRUN:
@@ -119,22 +129,25 @@ def save_json(path: str, obj, overwrite: bool = False):
                 save_s3_json(obj, s3_key)
             else:
                 # Object exists and overwrite is False, skip saving
-                logging.info(f"S3 object exists, skipping: {s3_key}")
+                logging.info(f"S3/R2 object exists, skipping: {s3_key}")
             return
-        except s3_client.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == '404':
-                # Object does not exist, proceed to upload
-                save_s3_json(obj, s3_key)
-                # json_data = json.dumps(obj, ensure_ascii=False, indent=2)
-                # s3_client.put_object(
-                #     Bucket=S3_BUCKET,
-                #     Key=s3_key,
-                #     Body=json_data.encode('utf-8'),
-                #     ContentType='application/json'
-                # )
-                # logging.info(f"Saved to S3: {s3_key}")
+        except Exception as e:
+            # For R2/AWS the head_object will raise a ClientError if not found.
+            # Safer to catch general Exception and inspect response when available.
+            err_code = None
+            try:
+                err_code = e.response['Error']['Code']
+            except Exception:
+                pass
+            if err_code in ('404', 'NoSuchKey', 'NotFound') or getattr(e, 'response', None) is None:
+                # Object does not exist (or we couldn't inspect) — proceed to upload
+                try:
+                    save_s3_json(obj, s3_key)
+                except Exception as up_err:
+                    logging.error(f"Error saving to S3/R2 {s3_key}: {up_err}")
+                    raise
             else:
-                logging.error(f"Error checking S3 object {s3_key}: {e}")
+                logging.error(f"Error checking S3/R2 object {s3_key}: {e}")
                 raise
 
 
@@ -154,10 +167,15 @@ def read_progress(run_date: str) -> dict:
         try:
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
             return json.loads(response['Body'].read().decode('utf-8'))
-        except s3_client.exceptions.NoSuchKey:
-            return {'last_processed_index': -1, 'total_tickers': 0, 'run_date': run_date}
         except Exception as e:
-            logging.error(f"Error reading S3 progress file {s3_key}: {e}")
+            # Attempt to detect missing key
+            try:
+                code = e.response['Error']['Code']
+                if code in ('NoSuchKey', '404', 'NotFound'):
+                    return {'last_processed_index': -1, 'total_tickers': 0, 'run_date': run_date}
+            except Exception:
+                pass
+            logging.error(f"Error reading S3/R2 progress file {s3_key}: {e}")
             return {'last_processed_index': -1, 'total_tickers': 0, 'run_date': run_date}
 
 
@@ -231,12 +249,17 @@ def save_news_items(news_items: list[dict], ticker: str, run_date: str):
             s3_key = path.replace(BASE_DIR, '').lstrip('/')
             try:
                 s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
-                logging.debug(f"S3 news object exists, skipping: {s3_key}")
+                logging.debug(f"S3/R2 news object exists, skipping: {s3_key}")
                 continue
-            except s3_client.exceptions.ClientError as e:
-                if e.response['Error']['Code'] != '404':
-                    logging.error(f"Error checking S3 news object {s3_key}: {e}")
-                    continue
+            except Exception as e:
+                # If it's not a not-found condition, log and continue
+                try:
+                    code = e.response['Error']['Code']
+                    if code not in ('404', 'NoSuchKey', 'NotFound'):
+                        logging.error(f"Error checking S3/R2 news object {s3_key}: {e}")
+                        continue
+                except Exception:
+                    pass
         save_json(path, art)
         logging.info(f"Saved news → {path}")
 
@@ -270,12 +293,15 @@ def save_financials_yf(data: dict, ticker: str, run_date: str):
         s3_key = path.replace(BASE_DIR, '').lstrip('/')
         try:
             s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
-            logging.debug(f"S3 financials object exists, skipping: {s3_key}")
+            logging.debug(f"S3/R2 financials object exists, skipping: {s3_key}")
             return
-        except s3_client.exceptions.ClientError as e:
-            if e.response['Error']['Code'] != '404':
-                logging.error(f"Error checking S3 financials object {s3_key}: {e}")
-                return
+        except Exception as e:
+            try:
+                if e.response['Error']['Code'] != '404':
+                    logging.error(f"Error checking S3/R2 financials object {s3_key}: {e}")
+                    return
+            except Exception:
+                pass
     save_json(path, data)
     dates = list(data.get('income_statement_quarterly', {}))
     if dates:
@@ -325,12 +351,15 @@ def save_statistics_yf(data: dict, ticker: str, run_date: str):
         s3_key = path.replace(BASE_DIR, '').lstrip('/')
         try:
             s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
-            logging.debug(f"S3 statistics object exists, skipping: {s3_key}")
+            logging.debug(f"S3/R2 statistics object exists, skipping: {s3_key}")
             return
-        except s3_client.exceptions.ClientError as e:
-            if e.response['Error']['Code'] != '404':
-                logging.error(f"Error checking S3 statistics object {s3_key}: {e}")
-                return
+        except Exception as e:
+            try:
+                if e.response['Error']['Code'] != '404':
+                    logging.error(f"Error checking S3/R2 statistics object {s3_key}: {e}")
+                    return
+            except Exception:
+                pass
     save_json(path, data)
     dt = datetime.strptime(run_date, '%Y-%m-%d')
     logging.info(f"Latest statistics snapshot for {ticker}: {dt.strftime('%B %Y')}")

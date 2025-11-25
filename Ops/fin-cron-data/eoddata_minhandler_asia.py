@@ -14,6 +14,7 @@ import time
 import argparse
 import dataUtil as DU
 
+InitialRun = False
 
 load_dotenv() 
 DEBUG=environ.get("DEBUG")
@@ -41,9 +42,16 @@ def yf_get_max_datetime(localnow, sym=None):
     logging.debug(f"maxdate : {Sdatetime} for {DBMKTDATA}.{TBLMINUTEPRICE} : {sym}")
     return Sdatetime
 
+
 def yf_download(sym, sdatetime, edatetime):
-    logging.debug(f"yf_download({sym}, {sdatetime} - {edatetime})")
-    sDF = yf.download(sym, start=sdatetime, end=edatetime, interval='30m', auto_adjust=False)
+    global InitialRun
+
+    if InitialRun:
+        logging.debug(f"yf_download({sym}, InitialRun)")
+        sDF = yf.download(sym, interval='15m', auto_adjust=False, multi_level_index=False)
+    else:
+        logging.debug(f"yf_download({sym}, {sdatetime} - {edatetime})")
+        sDF = yf.download(sym, start=sdatetime, end=edatetime, interval='15m', auto_adjust=False, multi_level_index=False)
     if len(sDF) > 0:
         sDF = sDF.reset_index()
         if 'Adj Close' in sDF.columns:
@@ -148,6 +156,7 @@ def minute_output_columns():
     return ["Datetime", "Symbol", "Exchange", "garch", "svr", "mlp", "LSTM", "prev_Close", "prediction", "volatility"]
 
 def run(event, context):
+    global InitialRun
 
     utcNow = datetime.now(pytz.utc)
     Sdatetime = yf_get_max_datetime(utcNow)
@@ -157,6 +166,8 @@ def run(event, context):
         localrun = event["localrun"]
     if "dbFlag" in event:
         dbFlag = event["dbFlag"]
+    if "InitialRun" in event:
+        InitialRun = event["InitialRun"]
     list_N = ["stock_list", "etf_list", "crypto_list", "us-cn_stock_list"]
     SYMBOLLIST = environ.get("SYMBOLLIST")
     if SYMBOLLIST is not None:
@@ -167,5 +178,5 @@ def run(event, context):
 
 if __name__ == '__main__':
 
-    event={"localrun":True, "dbFlag":True}
+    event={"localrun":False, "dbFlag":True, "InitialRun": True}
     run(event, 0)

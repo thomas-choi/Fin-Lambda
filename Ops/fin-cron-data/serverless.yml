@@ -13,7 +13,7 @@ provider:
   runtime: python3.10
   region: us-east-2
   profile: ServerLessUser
-  timeout: 120     # default is 6 sec
+  timeout: 900     # default is 6 sec
   iam:
     role:
       statements:

@@ -129,9 +129,15 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+venv*/
 venv-cron/
 venv-cron?/
 venv-*/
+results/
+temp/
+clientportal.gw/
+output/
+*.zip
 
 # Spyder project settings
 .spyderproject

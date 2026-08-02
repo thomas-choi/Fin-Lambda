@@ -173,3 +173,6 @@ cython_debug/
 .serverless/
 node_modules/
 new_code/
+
+Dev/
+Ops/fin-cron-Pgsql/

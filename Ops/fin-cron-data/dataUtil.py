@@ -3,7 +3,7 @@ from os import path
 from os import environ
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import logging
 from datetime import datetime, timedelta
 import pytz
@@ -104,12 +104,25 @@ def get_Latest_row_by_Symbol(dbntable, symbol):
         logging.error("Exception occurred at get_Latest_row_by_Symbol()", exc_info=True)
 
 def ExecSQL(query):
+    """
+    Execute a statement and return the number of rows affected.
+
+    Works on both SQLAlchemy 1.4 and 2.0: `Engine.execute()` was removed in
+    2.0, so the statement goes through `Engine.begin()` + `text()`, which
+    exist in both. `begin()` commits explicitly, matching the implicit commit
+    1.4's legacy autocommit gave the DELETE/TRUNCATE callers.
+
+    Returns the rowcount on success, None on failure. Failures are logged, not
+    raised -- callers across this repo rely on that contract.
+    """
     logging.info(f"ExecSQL: {query}")
     try:
-        results = get_DBengine().execute(query)
-        logging.info(f'number of rows execed: {results.rowcount}')
+        with get_DBengine().begin() as conn:
+            rowcount = conn.execute(text(query)).rowcount
+        logging.info(f'number of rows execed: {rowcount}')
+        return rowcount
     except Exception as e:
-        logging.error("Exception occurred at load_df(np.linspace)", exc_info=True)
+        logging.error("Exception occurred at ExecSQL()", exc_info=True)
 
 def load_df_SQL(query):
     """

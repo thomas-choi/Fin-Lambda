@@ -36,10 +36,30 @@ all: finWebLib.zip finSvrLib.zip finVisLib.zip finSvr2Lib.zip finDataLib.zip fin
 ldaShell:
 	docker build -t mylambda .
 
-finCron.zip: 
+finCron.zip:
 	$(RM) -rf ./python
 	pip3 install -r Ops/fin-cron-data/requirements_cron.txt -t python/lib/python3.10/site-packages
 	zip -r9 $@ python/
+
+# Layer for portAssetsHandler, the only python3.13 function in this service.
+# Note the python3.13 site-packages path -- every other target hardcodes
+# python3.10, and a layer built under the wrong path is silently unimportable.
+#
+# The explicit --platform/--python-version flags matter: the local interpreter
+# is 3.10, so a plain `pip3 install` would resolve cp310 wheels that a 3.13
+# Lambda cannot load. --only-binary=:all: makes a missing cp313 wheel a build
+# failure rather than a source build against the wrong Python.
+finPort313.zip:
+	$(RM) -rf ./python
+	pip3 install -r Ops/fin-cron-data/requirements_port313.txt -t python/lib/python3.13/site-packages
+# 	pip3 install -r Ops/fin-cron-data/requirements_port313.txt \
+# 		--platform manylinux2014_x86_64 \
+# 		--implementation cp --python-version 3.13 \
+# 		--only-binary=:all: \
+# 		--no-compile \
+# 		-t python/lib/python3.13/site-packages
+	zip -r9 $@ python/
+	@echo "unzipped size: $$(du -sh python | cut -f1)  (Lambda limit: 250 MB unzipped, all layers combined)"
 
 finWebLib.zip: 
 	$(RM) -rf ./python

@@ -1,0 +1,23 @@
+# Development / test dependencies.
+#
+# Deliberately kept OUT of Ops/fin-cron-data/requirements_cron.txt and
+# requirements_port313.txt so the Lambda layers stay lean — nothing here is
+# ever deployed.
+#
+# Install into the same venv that carries the pinned layer versions
+# (pandas==1.5.3, SQLAlchemy==1.4.46, numpy==1.26.4, yfinance==0.2.58) so the
+# suite exercises what actually runs in Lambda:
+#
+#   venv-cron7/bin/pip install -r requirements-dev.txt
+#   venv-cron7/bin/python -m pytest tests/unit -v
+
+pytest==7.4.4
+pytest-mock==3.14.0
+freezegun==1.5.1
+responses==0.25.3
+
+# Parsers used by port_assets_handler. Present in requirements_port313.txt for
+# the Lambda layer; repeated here so the unit suite can run without the layer.
+lxml==6.1.1
+openpyxl==3.1.5
+beautifulsoup4==4.13.4

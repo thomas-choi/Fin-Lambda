@@ -1,5 +1,10 @@
 service: fin-cron-data
 
+# Leave this commented out. Serverless Framework 3.38's runtime allowlist stops
+# at python3.11, so portAssetsHandler's `runtime: python3.13` raises a config
+# validation *warning*. It is cosmetic -- `serverless package` renders
+# python3.13 into CloudFormation correctly, and CloudFormation accepts it --
+# but turning validation on would make it a hard error and block every deploy.
 # configValidationMode: error
 
 frameworkVersion: '3'
@@ -88,3 +93,30 @@ functions:
     handler: yf-news-collect.run
     events:
       - schedule: cron(1 * * * ? *) # 11:30 pm EDT (UTC-4) every day
+  portAssetsHandler:
+      # S&P 500 / NASDAQ-100 index membership -> Trading.portfolio_assets_info
+      #
+      # The ONLY python3.13 function in this service. The runtime and the layer
+      # are declared here, on the function -- never at provider level -- so the
+      # 3.13 layer can never be picked up by one of the nine python3.10
+      # functions, whose layer pins pandas 1.5.3 / SQLAlchemy 1.4.46.
+    handler: port_assets_handler.run
+    runtime: python3.13
+    # TODO: uncomment once finPort313 has been published as a layer and the
+    # version is known. Build with `make finPort313.zip` from the repo root
+    # (39 MB zipped / 138 MB unzipped -- under the 50 MB direct-upload limit),
+    # then:
+    #   aws lambda publish-layer-version --layer-name finPort313 \
+    #     --zip-file fileb://finPort313.zip \
+    #     --compatible-runtimes python3.13 \
+    #     --region us-east-2 --profile ServerLessUser
+    layers:
+      - arn:aws:lambda:us-east-2:567575054547:layer:finPortLib:3
+
+    events:
+      # 22:30 UTC Mon-Fri: ~1.5 h after the US close in EDT, ~2.5 h in EST.
+      # Index committees announce membership changes to take effect at an open,
+      # so a daily post-close check catches every change within one business
+      # day. Only-on-change makes a no-change day nearly free: two HTTP fetches,
+      # one SELECT, exit.
+      - schedule: cron(30 22 ? * MON-FRI *)

@@ -176,3 +176,10 @@ new_code/
 
 Dev/
 Ops/fin-cron-Pgsql/
+
+ve310/
+configure/
+Ops/fin-data-http-api/
+mydemo/
+Ops/test-env-passing/
+Ops/fin-cron-data/Product_List/

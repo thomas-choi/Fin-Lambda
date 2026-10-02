@@ -10,14 +10,31 @@ and the tables they write.
 
 ## Changelog
 
+- 2026-10-01 | Modified | §6.2 `option_chains()` retries twice, not five times — the sweep invocations are the real retry.
+- 2026-10-01 | Added | §5 `current_symbols_V5` and its `@type` argument ('a' all-but-delisted, 'o' also drops `options = 0`); §6.2 the data flow now shows which type each collector asks for; §6 `dataUtil.load_symbols_db` gains `sym_type` and `symbol_proc_type`.
+- 2026-10-01 | Modified | §5 `current_symbols_V4` row: measured 863 rows, and it is the unfiltered union — the exclusion list is V5's.
+- 2026-10-01 | Added | §6 `dataUtil` API gains `out_dir()` / `on_lambda()`; the six handlers no longer compute their own output directory.
+- 2026-10-01 | Modified | §6 the optChainEOD dispatcher rationale: `reservedConcurrency` is commented out (account concurrency quota is 10), so the shard fan-out is currently uncapped.
 - 2026-08-01 | Added | Initial file: deployed-functions table, `portAssetsHandler` deep-dive, `dataUtil` API reference, `Trading.portfolio_assets_info` schema, stored-procedure dependency list.
+- 2026-10-01 | Added | §6 the `fin-deep-data` service (PLAN-SR-UPSTREAM A–F): its eight python3.13 functions, the three-layer split, per-function packaging, the `dataUtil` fork and its Phase A helpers, the `load_audit` / `corp_action_daily` / `v_load_status` tables, and the v2 successors with disabled schedules.
+- 2026-10-01 | Modified | §1 deployed-functions table now says which service each function belongs to; §5 adds `current_symbols_V4` and records which procedures the new service depends on.
 
 ---
 
 ## 1. Deployed functions
 
-All in `Ops/fin-cron-data/serverless.yml`. Region `us-east-2`, `timeout: 900`,
-AWS profile `ServerLessUser`.
+Two Serverless services, both in region `us-east-2` with `timeout: 900` and AWS
+profile `ServerLessUser`:
+
+- **`fin-cron-data`** (`Ops/fin-cron-data/serverless.yml`) — the ten functions
+  below. Nine on python3.10 / `finCron`, one (`portAssetsHandler`) on
+  python3.13 / `finPortLib`. Frozen as of 2026-10-01: new work goes to the other
+  service.
+- **`fin-deep-data`** (`Ops/fin-deep-data/serverless.yml`) — eight python3.13
+  functions, §6. Three new data sets and five successors to functions in
+  `fin-cron-data`.
+
+The two share no file, no layer and no `.env`.
 
 | Function | Handler | Schedule (UTC) | Runtime | Writes to |
 |---|---|---|---|---|
@@ -274,11 +291,181 @@ handlers silently.
 
 | Procedure | Used by |
 |---|---|
-| `GlobalMarketData.current_symbols_V3` | `dataUtil.load_symbols("system")` |
-| `GlobalMarketData.get_us_symbol` | `eoddata_minhandler_us.py` |
-| `GlobalMarketData.get_asia_symbol` | `eoddata_minhandler_asia.py` |
+| `GlobalMarketData.current_symbols_V3` | `dataUtil.load_symbols("system")` (fin-cron-data) |
+| `GlobalMarketData.current_symbols_V4` | `eodDaily`, `optChainEOD` via `dataUtil.load_symbols_db("V4")` (fin-deep-data). Takes no argument. 863 rows on 2026-10-01; it already contains the stock-options list, the ETF-options list and the `portfolio_assets_info` members, so the new handlers add no union of their own. No exclusions — delisted symbols are in it |
+| `GlobalMarketData.current_symbols_V5(IN p_type CHAR(1))` | the same two handlers once `SYMBOL_PROC_VER=V5`. V4's union **minus an exclusion list read from `GlobalMarketData.SymbolMaster`**: `@type='a'` drops `delisted = 1` (838 rows), `@type='o'` drops `options = 0 OR delisted = 1` (814). `eodDaily` asks for `'a'`, `optChainEOD` for `'o'`. A symbol with no `SymbolMaster` row is kept by both — 648 of the 863 are in that position, so `'o'` is an exclusion list, not a whitelist. DDL in `Ops/fin-deep-data/sql/current_symbols_V5.sql`; MySQL has no default argument values, so the caller always sends one |
+| `GlobalMarketData.get_us_symbol` | `eoddata_minhandler_us.py`; `intraday_min_handler.run_us` |
+| `GlobalMarketData.get_asia_symbol` | `eoddata_minhandler_asia.py`; `intraday_min_handler.run_asia` |
 | `Trading.sp_etf_trades_v2` | `opt_handler.py` |
 | `Trading.sp_stock_trades_V3` | `opt_handler.py` |
 
 `portAssetsHandler` depends on **none** of them — its symbol lists come from
 the public sources in §2.
+
+---
+
+## 6. The `fin-deep-data` service (python3.13)
+
+`Ops/fin-deep-data/` — PLAN-SR-UPSTREAM Phases A–F, implemented 2026-10-01 as a
+**separate Serverless service** so that no function or layer of `fin-cron-data`
+changes. Every function is `python3.13`; the runtime and the layer ARNs are
+declared on each function, never at provider level.
+
+### 6.1 Functions
+
+| Function | Handler | Layers | Schedule (America/New_York) | Writes |
+|---|---|---|---|---|
+| eodDaily | `eod_daily_handler.run` | core + yf | 18:30 Mon–Fri; sweep 19:00 | `$EOD_WRITE_TBL` (INSERT IGNORE), `corp_action_daily`, `load_audit` |
+| optChainEOD | `optchain_eod_handler.run` | core + yf | dispatch 17:40; sweeps 18:40, 19:40 | `$OPT_WRITE_TBL` (INSERT IGNORE), R2 `$OPT_RAW_PREFIX/`, `load_audit` |
+| statusReport | `status_report_handler.run` | core | 20:00 Mon–Fri | nothing — SNS e-mail + R2 JSON |
+| portAssetsHandlerv2 | `port_assets_handler.run` | core + web | 18:30 — **disabled** | `Trading.portfolio_assets_info` (only-on-change), `load_audit` |
+| usrateHandlerv2 | `usrate_handler.run` | core + web | 17:05 — **disabled** | `$TBLUSRATES`, `load_audit` |
+| FXHistHandlerv2 | `fxeod_handler.run` | core + yf | 17:10 — **disabled** | `$TBLHISTFX`, `load_audit` |
+| yfus30minEODv2 | `intraday_min_handler.run_us` | core + yf | 20:05 — **disabled** | `$TBLMINUTEPRICE`, `load_audit` |
+| yfasia30minEODv2 | `intraday_min_handler.run_asia` | core + yf | 06:00 — **disabled** | `$TBLMINUTEPRICE`, `load_audit` |
+
+Schedules use EventBridge Scheduler (`method: scheduler`) with an explicit
+`timezone`, so they hold their exchange-local time across DST instead of
+drifting an hour the way `fin-cron-data`'s UTC cron entries do.
+
+**Why five schedules are disabled.** Each of those five functions writes a table
+that its python3.10 counterpart in `fin-cron-data` still writes. Two writers on
+one table would duplicate rows (`$TBLMINUTEPRICE`, `$TBLHISTFX`, `$TBLUSRATES`)
+or store a spurious membership change (`portfolio_assets_info`). The schedules
+therefore render as `AWS::Scheduler::Schedule` with `State: DISABLED`: deploying
+the service is always safe, and each data set is cut over on its own, by
+enabling one schedule and removing the old function —
+`doc/OPERATIONS.md` §11.
+
+`load_audit.job` is the **data set's** job name, not the Lambda's, so these five
+write `usrateHandler`, `FXHistHandler`, `yfus30minEOD`, `yfasia30minEOD` and
+`portAssetsHandler`. The status report keys on `(table_name, job)`, so it does
+not grow a second line at the cutover; `load_audit.host` says which function
+wrote the row.
+
+### 6.2 Data flow
+
+```
+              current_symbols_{SYMBOL_PROC_VER}
+            V4: 863 no exclusions | V5: 'a' 838 / 'o' 814
+                              |
+            +-----------------+------------------+
+            |                                    |
+        eodDaily                            optChainEOD
+     @type 'a'                            @type 'o'
+   shard -> watermark SELECT            dispatch -> N async shards
+   -> plan (batch by exchange tz,       -> per underlying:
+      singles for first loads/gaps)        option_chains() 2x retry
+   -> yf.download(auto_adjust=False,       -> filter_opt_chain()
+      actions=True, group_by=ticker)       -> INSERT IGNORE $OPT_WRITE_TBL
+   -> reshape_batch -> drop_partial_bar    -> raw CSV -> R2
+   -> INSERT IGNORE $EOD_WRITE_TBL         -> load_audit row
+   -> extract_actions -> corp_action_daily
+   -> load_audit row per symbol + '*' summary per table
+            |                                    |
+            +----------------+-------------------+
+                             v
+                    load_audit -> v_load_status
+                             v
+                       statusReport -> SNS e-mail + R2 status/latest.json
+```
+
+Both collectors are idempotent: writes are `INSERT IGNORE`, so a re-run, an
+overlapping sweep and a retried async shard can never duplicate a row. The
+sweeps re-run only what has no `ok`/`empty` audit row for the session date
+(`missing_for_sweep`), and a `time_left_ok` guard marks unstarted symbols
+`skipped` rather than letting the Lambda die mid-batch.
+
+### 6.3 Key design decisions
+
+| Decision | Why |
+|---|---|
+| `INSERT IGNORE`, not `to_sql` append | the collectors re-run (sweeps, async retries, a manual replay) and the price tables have real primary keys; the first value written wins, so a replay never changes history |
+| One `GROUP BY` watermark query | the production host job issued 857 separate `MAX(Date)` queries |
+| Batch downloads grouped by exchange time zone | a batched `yf.download` mixing US and HK tickers yields NaN rows on dates where one market is closed (finding F7); NaN-`Close` rows are dropped as well |
+| 21-day batch window | ≈14 sessions — enough to re-see a late-posted dividend or split, so it doubles as the corporate-action window |
+| `drop_partial_bar` | the production cron ran 10 minutes after the close and in winter captured non-final bars (finding L2). A bar dated the exchange's local today is kept only 60 minutes after that exchange's close; crypto, which never closes, is always treated as partial |
+| `auto_adjust=False` pinned | from yfinance 0.2.51 the default is `True`, which silently adjusts O/H/L/C and drops `Adj Close` |
+| Dispatcher instead of N schedule entries | `OPT_SHARDS` is sized from a measured `T_total`, and changing it means changing one env var rather than editing `serverless.yml`; `reservedConcurrency` was to cap parallel Yahoo traffic from Lambda IPs — but it is **commented out**, because reserving needs ≥ 100 unreserved executions and the account quota is 10, so the fan-out is currently uncapped and shares that pool of 10 with the live python3.10 functions (`doc/OPERATIONS.md` §8.4) |
+| `corp_action_daily` keyed `(Date, Symbol, Exchange)` | `INSERT IGNORE` keeps the **first** sighting, which makes `first_seen_at` an honest `available_at` for the action |
+| Audit writes wrapped in `try` | an audit failure must never fail a data load; `dataUtil.audit_run` additionally swallows its own errors |
+| Two merged intraday handlers | `eoddata_minhandler_us.py` and `_asia.py` differed only in a stored-procedure name and the audit job name; `intraday_min_handler.MARKETS` holds that difference and the two Lambdas point at `run_us` / `run_asia` |
+
+### 6.4 Packaging — one `serverless.yml`, eight zips
+
+`package: individually: true`, a service-wide `'!**'` baseline, and a
+`package.patterns` allowlist on each function. Without the `'!**'` line
+Serverless would zip the whole folder — `node_modules`, the build trees, any
+dry-run CSV left behind — into all eight packages.
+
+| Package | Contents | Size |
+|---|---|---|
+| eodDaily | `dataUtil.py`, `eod_daily_handler.py`, `stock_exchange.csv`, `Exchange_timezone.csv` | 65 KB |
+| optChainEOD | the above + `optchain_eod_handler.py` (imports `exchange_for`) | 71 KB |
+| statusReport | `dataUtil.py`, `status_report_handler.py` | 14 KB |
+| portAssetsHandlerv2 | `dataUtil.py`, `port_assets_handler.py` | 21 KB |
+| usrateHandlerv2 | `dataUtil.py`, `usrate_handler.py` | 11 KB |
+| FXHistHandlerv2 | `dataUtil.py`, `fxeod_handler.py` | 11 KB |
+| yfus30minEODv2 / yfasia30minEODv2 | `dataUtil.py`, `intraday_min_handler.py`, both exchange CSVs, `intra_blacklist.csv` | 61 KB each |
+
+### 6.5 Three layers, not one
+
+| Layer | Contents | Unzipped | Zipped |
+|---|---|---|---|
+| `finDeepCore` | pandas 2.2.3, numpy 2.1.3, SQLAlchemy 2.0.36, PyMySQL 1.1.1, python-dotenv, pytz, requests | 101 MB | 29 MB |
+| `finDeepYf` | yfinance 0.2.58, curl_cffi, peewee, frozendict, multitasking, platformdirs, beautifulsoup4 | 28 MB | 10 MB |
+| `finDeepWeb` | lxml 5.3.0, beautifulsoup4, openpyxl 3.1.5 | 14 MB | 6 MB |
+
+`finDeepYf` and `finDeepWeb` are de-duplicated against `finDeepCore` at build
+time, so neither is importable without it. Build procedure and the size ceiling:
+`doc/OPERATIONS.md` §10.
+
+### 6.6 `dataUtil.py` is a fork
+
+`Ops/fin-deep-data/dataUtil.py` was taken from `Ops/fin-cron-data/dataUtil.py`
+at `fa1d6ac` and is maintained separately. A change in one does **not**
+propagate to the other, and that is the point: the fin-cron-data copy ships to
+nine python3.10 functions on pandas 1.5 / SQLAlchemy 1.4 and is frozen.
+
+Differences from the original:
+
+| Added / changed | Returns | Notes |
+|---|---|---|
+| `append_ignore(df, schema, table, chunk=500)` | rows inserted \| `None` | `INSERT IGNORE` (MySQL) or `INSERT OR IGNORE` (sqlite), chosen from the dialect; the sqlite branch exists so the test fixture can exercise it for real |
+| `audit_run(rows)` / `audit_frame(rows)` / `audit_summary(...)` | rows inserted \| `None` / `DataFrame` / `dict` | `load_audit` writer, its pure frame builder, and the `'*'` summary row. `error` is cut to 512 chars because the server runs `STRICT_ALL_TABLES` |
+| `new_run_id()` / `run_host()` | 26-char ULID / `str` | hand-rolled Crockford base32, so the layer needs no ULID dependency; host is `lambda:<function>` or the hostname |
+| `shard_symbols(symbols, i, n)` | `list` | round-robin over the sorted, de-duplicated list; raises on a bad index |
+| `time_left_ok(context, reserve_ms=120_000)` | `bool` | `True` when `context` is `None`, i.e. always locally |
+| `missing_for_sweep(job, date, expected, table_name)` | `list` \| `None` | expected symbols with no `ok`/`empty` row since that session's local midnight; `None` when `load_audit` cannot be read, so a sweep never guesses |
+| `require_env(name)` / `env_or(name, default)` | `str` | `require_env` **raises** — the one place in this module that does. `environ.get()` returning `None` would interpolate the string `'None'` into SQL |
+| `day_start_utc(day, tz)` / `utc_now()` | tz-naive `datetime` | UTC, the form `load_audit`'s `DATETIME(3)` columns hold |
+| `out_dir(localrun=False, env_key=None)` | `str` | Where a dry run's CSVs go. **Always under `/tmp` on Lambda**, whatever `localrun` says, because `/var/task` is read-only; a configured `env_key` outside `/tmp` is ignored with a warning. Locally `localrun` means the CWD. Replaced six per-handler copies of an inverted condition (`doc/OPERATIONS.md` §8.6) |
+| `on_lambda()` | `bool` | `AWS_LAMBDA_FUNCTION_NAME` is set |
+| `load_symbols_db(ver="V3", sym_type=None)` | `list` | `CALL GlobalMarketData.current_symbols_{ver}`. `sym_type` is V5's `@type`; it is **withheld** from the versions in `UNTYPED_SYMBOL_PROCS` (`V1`–`V4`), which take no argument, and sent for anything else. That is what lets a handler pass its type unconditionally while `SYMBOL_PROC_VER` still names V4 |
+| `symbol_proc_type(sym_type)` | `'a'` \| `'o'` | Normalises the `@type`. `None`, `''` and anything unrecognised become `'a'`, mirroring the procedure's own defaulting, and the result is the only thing interpolated into the SQL — an event-supplied value never is |
+| `list_dir()` | `str` | **changed behaviour**: `PROD_LIST_DIR` when set, else this module's own directory. The CSVs are packaged beside `dataUtil.py`, so neither the Lambda nor a local run depends on the CWD. `load_symbols`, `load_symbols_dict`, `load_exchange_tz` and `get_Symbollist` all read through it |
+
+### 6.7 New tables
+
+DDL: `Ops/fin-deep-data/sql/upstream_tables.sql` (idempotent; run by the owner).
+All confirmed present on the server on 2026-10-01.
+
+**`GlobalMarketData.load_audit`** — one row per (run, data set, symbol) plus a
+`Symbol = '*'`, `segment = 'summary'` row per (run, data set). Written with
+`INSERT IGNORE`; never updated. Primary key
+`(run_id, table_name, Symbol, Exchange)` — a deliberate deviation from the SR
+tech doc's `(run_id, Symbol, Exchange)`, because one `eodDaily` invocation writes
+two data sets and needs a summary row for each; under SR's key the second would
+be silently dropped. Column reference: `doc/API-REFERENCE.md` §7.
+
+**`GlobalMarketData.corp_action_daily`** — non-zero `Dividends` / `StockSplits`
+seen in eodDaily's window, keyed `(Date, Symbol, Exchange)` so the first
+sighting and its `first_seen_at` win.
+
+**`GlobalMarketData.v_load_status`** — the latest summary row per
+`(table_name, job)`, via `ROW_NUMBER()`. Read by `statusReport` and by
+Support-Resistance-Agent's `sr status`.
+
+**`histdailyprice7_shadow` / `OptionChains_shadow`** — `CREATE TABLE … LIKE` of
+the production tables, the write targets during the shadow run. The cutover is
+an env-var flip of `EOD_WRITE_TBL` / `OPT_WRITE_TBL`.

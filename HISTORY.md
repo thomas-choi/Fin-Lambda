@@ -7,6 +7,786 @@ Newest first.
 
 ---
 
+## 2026-10-02 — PLAN-SR-UPSTREAM Phase D: the report body and its cases written down
+
+### Goal
+
+Phase D's six bullets described `statusReport` by naming its functions and
+deferring its actual output to SR tech doc §4.5.7 in another repository
+(`~/projects/Support-Resistance-Agent`). Anyone reading the plan alone could not
+tell what the report looks like, which column comes from where, or when a line
+reads `partial` rather than `stale`. Documentation only — no code, config or
+schedule changed.
+
+### Implementation detail
+
+Two subsections added to `PLAN-SR-UPSTREAM.md` after the existing Phase D
+bullets, which are left as they stand:
+
+- **D.1 The report body** — SR §4.5.7's five-line example reproduced in full, the
+  `HEADER`/`WIDTHS` geometry, the e-mail subject and the indented per-error
+  lines, the `(table_name, job)` grain and its link to P4's primary-key
+  deviation, and a per-column source table. Records that `Symbols` counts
+  **distinct** symbols over the day's `segment <> 'summary'` rows rather than
+  summing shard counters, which is what makes `partial` meaningful under Phase
+  C's fan-out, and the U10 fallback to summed `n_ok`/`n_expected`.
+- **D.2 The cases** — audited vs. inferred lines as a two-column table;
+  `INFERRED_TABLES` as the six production tables and why that makes the report
+  readable during the U5 shadow run; the five status outcomes in their
+  `error > stale > partial > ok` precedence plus `—`; `EVENT_TABLES`
+  (`corp_action_daily`, `portfolio_assets_info`) being judged on last *run*
+  because a quiet day legitimately writes zero rows; holidays deliberately not
+  modelled; and that SNS and R2 fail independently while an unreadable
+  `v_load_status` still sends a report.
+
+The `format_report()` bullet now points at D.1/D.2 instead of at §4.5.7 alone.
+
+`EVENT_TABLES` and the `—` status were in the handler but in no plan or doc
+file; D.2 is the first written record of either.
+
+### Related files
+
+- `PLAN-SR-UPSTREAM.md` — Phase D, new §D.1 and §D.2 (+91 lines)
+
+### Test coverage
+
+No verification added or removed: no module, event contract, env var or table
+changed. The content was read off
+`Ops/fin-deep-data/status_report_handler.py` (`HEADER`/`WIDTHS`,
+`INFERRED_TABLES`, `EVENT_TABLES`, `status_for`, `aggregate_shards`,
+`audited_lines`, `format_line`, `run`) and cross-checked against SR tech doc
+§4.5.7 line 1223 and row U9 line 1151; the behaviour it describes is already
+covered by `tests/unit/test_status_report_handler.py` (320-test suite, Phase D
+rows unchanged). No `doc/*.md` body changed, so no changelog line was due
+there — the four canonical docs document the `load_audit`/`v_load_status`
+columns and the R2 key, neither of which this touches.
+
+---
+
+## 2026-10-01 — `optChainEOD`: `max_retries` 5 → 2
+
+### Goal
+
+Five attempts per underlying is too many. A yfinance failure here is a
+rate-limit or a dead ticker, and neither clears inside a 20 s inline wait, so
+attempts 3–5 spent the shard's time budget to fail again.
+
+### Implementation detail
+
+`max_retries = 2` in `Ops/fin-deep-data/optchain_eod_handler.py` (`retry_delay`
+unchanged at 5 s). The constant carries the reasoning, and `option_chains`'s
+docstring no longer claims the loop matches production's — the attempt count is
+now the one deliberate difference from `myFinData@19c8509`.
+
+The two scheduled sweeps (18:40, 19:40 ET) are the real retry: they run 60 and
+120 min after the dispatch, by which time a rate limit has reset.
+
+### Measured effect
+
+Full 863-symbol timing dry run, writes off, against the committed
+`optchain_timing_2026-10-01.csv` (2,063 s):
+
+| status | n, before → after | total s, before → after | mean s |
+|---|---|---|---|
+| `error` | 39 → 38 | **914.8 → 238.6** | 23.5 → 6.3 |
+| `ok` | 624 → 379 | 1,101.4 → 677.6 | 1.76 → 1.79 |
+| `empty` | 200 → 446 | 46.8 → 215.8 | 0.23 → 0.48 |
+
+An errored underlying costs ~6 s instead of ~24 s, and the mean for a symbol
+that returns a chain is unchanged — the change touches the failure path only.
+
+**The 1,131.9 s total is not the new `T_total`.** 245 underlyings that returned a
+chain in the baseline came back **empty** in this run (`MRVL`, `MS`, `MRSH`,
+`HYGH`, `CBAT` among them), and still did when re-requested individually, with no
+error — Yahoo serving no expiries to this IP at 23:50 local (04:50 UTC). Adding
+them back at the measured 1.79 s mean gives ~1,570 s, so `opt_shards_needed` is
+3 on either reading; the run printed 3.
+
+**`OPT_SHARDS` left at 4.** At 3 shards a ~1,570 s run leaves ~523 s per shard
+against the 540 s budget — 3 % margin, measured on an anomalous night. Re-measure
+at 17:40 ET before dropping it.
+
+### Finding, not changed: the sweeps do not retry `empty`
+
+`dataUtil.missing_for_sweep` counts `status IN ('ok', 'empty')` as done, so a
+throttled dispatch run loses those 245 underlyings for the session and reports
+`status: ok` with a clean `statusReport`. Narrowing it to re-try `empty` would
+re-request the ~200 legitimately empty symbols on every sweep, so it is recorded
+rather than changed (`doc/OPERATIONS.md` §10.6, plus a §9 row: watch `n_empty`,
+not only `n_error`).
+
+### Related files
+
+- `Ops/fin-deep-data/optchain_eod_handler.py` — `max_retries`, `option_chains` docstring
+- `Ops/fin-deep-data/tests/unit/test_optchain_eod_handler.py`
+- `doc/OPERATIONS.md` §10.6 + §9, `doc/TECHNICAL-DESIGN.md` §6.2
+
+### Test coverage
+
+**Modified** (320 passing, 1 skipped, `venv-py313`; count unchanged — no new
+test file, two rewritten cases):
+
+- `test_option_chains_retries_then_succeeds` — `fail_times` 2 → 1, asserts a
+  single 5 s sleep. At `max_retries = 2` the old fixture could no longer succeed.
+- `test_option_chains_gives_up_after_five` → `…_after_max_retries` — asserts 2
+  calls, one sleep, **and `H.max_retries == 2`**, so the constant cannot drift
+  without a test saying so.
+
+**Verification run:** the python3.13 warning gate passes; `py_compile` clean; the
+full timing dry run above completed `status: ok`, `n_expected: 863`,
+`rows_written: 27,562`.
+
+**Nothing retired.** `retry_delay`, the event contract and every other dry run
+are unchanged. No consumer-visible change, so `doc/PRODUCT-GUIDE.md` is untouched
+— the sweeps already covered what the inline retries now skip.
+
+---
+
+## 2026-10-01 — `current_symbols_V5`: a symbol list with an `@type` exclusion
+
+### Goal
+
+Move the `fin-deep-data` collectors onto `GlobalMarketData.current_symbols_V5`,
+which takes `@type` and subtracts an exclusion list read from
+`GlobalMarketData.SymbolMaster`:
+
+| `@type` | excludes | rows (2026-10-01) |
+|---|---|---|
+| `'a'` (default) | `delisted = 1` | 838 |
+| `'o'` | `options = 0 OR delisted = 1` | 814 |
+
+`eodDaily` asks for `'a'`, `optChainEOD` for `'o'` — every symbol V5 drops for
+`'o'` is one whose chain request would have come back empty, which is the
+cheapest available relief for the shard sizing in `TODOS.md` §2.13. V4 (863 rows,
+no exclusions) stays in place and `SYMBOL_PROC_VER` still names it; the flip to
+V5 is the owner's, once they have run the DDL.
+
+### Implementation detail
+
+**The procedure** — `Ops/fin-deep-data/sql/current_symbols_V5.sql`, new, for the
+owner to run. V4's five-way union verbatim, then one `DELETE … JOIN SymbolMaster`
+whose predicate depends on `@type`. Three decisions worth recording:
+
+- **MySQL has no default argument values.** "`@type` default `'a'`" is therefore
+  enforced twice — `dataUtil` sends `'a'` unless told otherwise, and the body maps
+  `NULL`, `''` and anything other than `'o'` to `'a'`. `CALL …_V5()` with no
+  argument is still an error, so the caller always sends one.
+- **`'o'` is an exclusion list, not a whitelist.** A symbol with no `SymbolMaster`
+  row is kept by both types. 648 of the 863 union symbols are in that position,
+  which is why `'o'` only removes 24 symbols beyond `'a'`'s 25. Confirmed as the
+  intent; the whitelist reading would return 166 and would drop 38 underlyings
+  that `Trading.Stock_Options` / `ETF_Options` actually hold.
+- **The column is `options`, not `option`** — see *Root cause* below.
+
+**`dataUtil.load_symbols_db(ver, sym_type=None)`** — sends the argument only for
+versions outside `UNTYPED_SYMBOL_PROCS` = {`V1`,`V2`,`V3`,`V4`}, which take none.
+A handler can therefore pass its type unconditionally while `SYMBOL_PROC_VER`
+still names V4, and the flip to V5 is an `.env` edit with no code change. The set
+lists the legacy versions rather than the typed ones so that a future V6 receives
+the argument by default instead of silently losing it. New
+`dataUtil.symbol_proc_type()` normalises the value and is the only thing
+interpolated into the `CALL`, so an event-supplied `symType` never reaches SQL.
+
+**The handlers** — module constants `SYMBOL_TYPE = "a"` (eodDaily) and `"o"`
+(optChainEOD), overridable per invocation with `{"symType": …}`. The empty-list
+error now names the type it asked for.
+
+**Unrelated bug fixed in passing:** `eod_daily_handler.__main__` passed
+`dbFlag: True` while its own comment said `False` — the exact shape of the
+2026-10-01 incident in `doc/OPERATIONS.md` §8.2, and it would have written to
+`histdailyprice7_shadow` and `load_audit` on any "dry run". Now `False`.
+
+### Root cause (incident found while verifying) — `option` vs `options`
+
+The first dry run failed inside `dataUtil.load_df_SQL`:
+
+```
+(1054, "Unknown column 'option' in 'where clause'")
+[SQL: call GlobalMarketData.current_symbols_V4]
+```
+
+`GlobalMarketData.SymbolMaster` is 215 rows with `Symbol, stock, crypto,
+options, brenchmark, fund, delisted`. There is no `option`, so a V4 carrying that
+spelling fails on every call; it was repaired on the server the same morning
+(`LAST_ALTERED 2026-10-02 05:41:51` UTC, the same evening local time) and now
+returns 863. The V5 SQL in this
+change uses `options` throughout — the draft it came from had `option`, so the
+typo was one `CREATE PROCEDURE` away from being reintroduced.
+
+What is worth keeping is the **failure mode**: `load_df_SQL` logs and returns
+`None`, so a handler reports `"symbol list … returned nothing"` with
+`n_expected: 0` and `statusReport` shows a 0-row load. Nothing distinguishes a
+broken procedure from an empty list. Recorded as `doc/OPERATIONS.md` §8.7 with
+the `CALL`-it-by-hand check and two troubleshooting rows (the second for the
+`ValueError: unsupported format character` that a literal `%` in a hand-written
+`dataUtil` query raises — hit while probing `information_schema`, pre-existing,
+not introduced here).
+
+### Related files
+
+- `Ops/fin-deep-data/sql/current_symbols_V5.sql` (new)
+- `Ops/fin-deep-data/dataUtil.py` — `load_symbols_db`, `symbol_proc_type`, `UNTYPED_SYMBOL_PROCS`, `SYMBOL_TYPES`
+- `Ops/fin-deep-data/eod_daily_handler.py`, `optchain_eod_handler.py`
+- `Ops/fin-deep-data/.env`, `.env.example` — `SYMBOL_PROC_VER` comment; the value stays `V4`
+- `Ops/fin-deep-data/tests/unit/test_dataUtil.py`, `test_eod_daily_handler.py`, `test_optchain_eod_handler.py`
+- `CLAUDE.md`, `doc/TECHNICAL-DESIGN.md`, `doc/API-REFERENCE.md`, `doc/OPERATIONS.md`, `doc/PRODUCT-GUIDE.md`
+
+### Test coverage
+
+**Added** (42 new, 278 → 320 passing, 1 skipped, in `venv-py313`):
+
+- `test_dataUtil.py` — `symbol_proc_type` parametrised over `a`/`o`/`O`/`" a "`/
+  `None`/`""`/`"x"`/`"a'; DROP"`; V5 receives `('a')`/`('o')`, and `None` → `('a')`;
+  V3/V4/`v4` receive **no** argument even when a type is passed; `V6` does receive
+  it; `load_symbols("system", "V5")` sends the `'a'` default. A shared `seen_sql`
+  fixture replaces the one-off fake.
+- `test_eod_daily_handler.py` / `test_optchain_eod_handler.py` — each asserts the
+  `(ver, sym_type)` its handler sends (`'a'` / `'o'`), that `{"symType": …}`
+  overrides it, and that an explicit `symbols` list skips the procedure entirely.
+  The `wired` fixtures now record the call instead of ignoring its arguments.
+
+**Verification run** (all in `venv-py313`, writes off):
+
+- `py_compile` + clean `import` of the three edited modules from the service
+  folder; the python3.13 warning gate (`-W error::FutureWarning:<module>`,
+  `-W error::DeprecationWarning:<module>` for all eight modules) passes.
+- **The procedure body executed against the live database as the Lambda DB user**
+  — statements extracted from the `.sql` file, run into a session temp table:
+  `@type='o'` 863 → 814, `@type='a'` 863 → 838, column `Symbol`. This is the
+  check the Lambda user can run before the procedure exists; `EXECUTE` on V5
+  still has to be granted after the owner creates it.
+- `eod_daily_handler.py` `__main__` (`dbFlag: False`, `test: 25`): completes,
+  list fetched from V4 with the type correctly withheld, writes the three CSVs.
+  The 25-symbol cap takes the head of a sorted list, which is all `.HK`, so
+  `rows_written: 0` / `n_empty: 24` — the same shape as before this change. With
+  `{"symbols": ["AAPL","MSFT","SPY"]}` the same handler writes 9,435 rows.
+- `optchain_eod_handler.run` with `{"dbFlag": False, "test": 3}` and with
+  `{"symbols": ["SPY"]}`: 368 rows, `status: ok`.
+- **Golden-CSV diff**, `options_eod_2026-10-01.csv` (committed) vs. the SPY dry
+  run: column set identical, no all-`NaN` column. One dtype differs —
+  `openInterest` `int64` vs the golden's `float64` — which is CSV inference on a
+  single-underlying file with no missing values, not a change to what is written.
+- `serverless print` from `Ops/fin-deep-data/` succeeds; `SYMBOL_PROC_VER: V4`
+  renders.
+
+**Not added.** No test asserts V5's own SQL, because the procedure is server-side
+and not in a schema this repo can create; the executed-body run above is the
+substitute, and it has to be repeated by the owner after the real `CREATE`
+(`doc/OPERATIONS.md` §11.1 step 1).
+
+**Nothing retired.** V4 keeps working and stays the configured version, so every
+existing dry run and golden CSV still applies.
+
+---
+
+## 2026-10-01 — first invoke of `fin-deep-data`: broken layers and a read-only CSV path
+
+### Goal
+
+Get a deployed function to actually run. The deploy from the previous entry
+succeeded, but the first manual invoke of `eodDaily` failed at import, and fixing
+that exposed a second failure behind it. Both were mine; neither touched data.
+
+### Root cause 1 — `strip` corrupted numpy's bundled OpenBLAS
+
+```
+[ERROR] Runtime.ImportModuleError: Unable to import module 'eod_daily_handler':
+Unable to import required dependencies:
+numpy: Error importing numpy: you should not try to import numpy from
+        its source directory; ...
+```
+
+`build_layers.sh`'s `prune_layer()` ran `strip --strip-unneeded` over every `.so`
+to save about 7 MB. That rewrote `numpy.libs/libscipy_openblas64_-ff651d7f.so`
+into `ELF load command address/offset not page-aligned`: `auditwheel` patches
+those bundled manylinux libraries with a non-standard page alignment that `strip`
+does not preserve. numpy reports it as an import-location problem and the real
+cause appears only in a chained `Original error was:` line that the Lambda log
+does not print — reproduced locally by importing the build tree under
+`venv-py313`, which is the same cp313/x86_64 target.
+
+The comment I had written on that line — "keeps the dynamic symbols the loader
+needs, so the extensions still import" — was true about symbols and irrelevant to
+the failure. It had never been tested by importing the tree.
+
+Why no check caught it: the only layer verification in place compared
+`CodeSha256` against the local zip (§10.3.1). The broken layer matched exactly,
+because the upload *was* intact. Nothing imported the contents before Lambda did.
+
+### Root cause 2 — `localrun` sent dry-run CSVs to the read-only `/var/task`
+
+With the layers fixed, the invoke downloaded and cleaned bars, then died on
+`OSError: [Errno 30] Read-only file system: './eod_daily_2026-10-01.csv'`.
+
+Six handlers each carried their own copy of
+
+```python
+if localrun or os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is None:
+    return "."
+```
+
+where `localrun or` lets the flag override the Lambda check, so a `localrun` dry
+run *on Lambda* writes into the read-only bundle. The docstring said "CWD
+locally, /tmp on Lambda" — the intent, not the code. `port_assets_handler` had
+the same inversion in a different shape, and `intraday_min_handler` had no
+directory logic at all, writing bare `30min_{sym}.csv`. This is exactly the
+invoke-only verification path the owner was told to use, so it would have failed
+on every function in turn.
+
+### Implementation detail
+
+- `Ops/fin-deep-data/build_layers.sh` — the strip pass is deleted, with the
+  reason recorded on the spot so it is not reintroduced for 7 MB.
+- `Ops/fin-deep-data/dataUtil.py` — new `out_dir(localrun, env_key=None)` and
+  `on_lambda()`. On Lambda `out_dir` always returns a path under `/tmp` whatever
+  `localrun` says, creates it, and ignores a configured directory outside `/tmp`
+  with a warning rather than obeying it into a crash. Locally `localrun` still
+  means the CWD, so documented dry-run output locations are unchanged.
+- `eod_daily_handler.py`, `fxeod_handler.py`, `optchain_eod_handler.py`,
+  `usrate_handler.py`, `port_assets_handler.py` — `_output_dir` now delegates to
+  it. `intraday_min_handler.py` — both `to_csv` calls routed through it.
+- Layers rebuilt and republished as **v2**; `.env` pins `:2`. v1 of
+  `finDeepCore` and `finDeepYf` is unusable and left published so the broken
+  hashes stay identifiable.
+
+Sizes grew, because the strip was saving much more than the comment claimed:
+core 94 → 101 MB unzipped (27 → 29 zipped), yf 10 → 28 MB (3 → 10 zipped) — the
+latter is `curl_cffi`'s bundled libcurl. Web is unchanged in size and differs
+only in hash, because lxml and openpyxl ship pre-stripped `.so` files; that is
+also the tell for which layers the strip actually altered. Both still pass the
+80 MB zip ceiling, and the worst per-function total is core+yf at 129 MB unzipped
+against AWS's 250 MB.
+
+No `Ops/fin-cron-data` file changed, and `finCronLib` / `finPortLib` were never
+touched — those are built by the `Makefile`, which has no strip step.
+
+### Related files
+
+- `Ops/fin-deep-data/build_layers.sh`, `dataUtil.py`, and the six handlers above
+- `Ops/fin-deep-data/.env` — layer ARNs bumped to `:2`
+- `doc/OPERATIONS.md` — §8.5, §8.6; §10.3.2 the import test; §7 the H.15 lag;
+  layer tables with v2 hashes and the broken v1s; four §9 troubleshooting rows
+- `doc/TECHNICAL-DESIGN.md`, `doc/API-REFERENCE.md` — `out_dir` / `on_lambda`
+- `Makefile`, `CLAUDE.md`, `PLAN-SR-UPSTREAM.md`, `Ops/fin-deep-data/README.md`
+  — corrected layer sizes
+
+### Test coverage
+
+**21 new tests, 278 → 299 passed (1 skipped).**
+
+- `tests/unit/test_dataUtil.py` — 11 tests for `out_dir` / `on_lambda`: CWD for a
+  local `localrun`, a configured directory honoured locally, `localrun` beating
+  that directory locally, and the invariant that matters — on Lambda the result
+  is always under `/tmp`, including a parametrised case where
+  `PORT_OUTPUT_DIR` is `.`, `/var/task`, `output` or empty.
+- `tests/unit/test_phase_f_handlers.py` — 10 tests, one per handler per
+  environment, asserting each `_output_dir` still delegates. The bug was six
+  copies of one wrong condition, so the regression risk is a handler going back
+  to deciding for itself.
+
+New verification procedure, `doc/OPERATIONS.md` §10.3.2: import-test each build
+tree in the layer combinations the functions mount, including
+`np.linalg.det` so OpenBLAS is really exercised — a plain `import numpy` is not
+enough. This is what a `CodeSha256` match cannot tell you, and it now runs after
+every layer build.
+
+Verified on Lambda with writes off after the fix: `eodDaily`
+`{"n_expected": 3, "n_ok": 3, "rows_written": 551, "actions_written": 1,
+"status": "ok"}`; `statusReport` 7 lines / 1 stale (`histdailyprice7_shadow`,
+correctly — its last data is 2026-09-25 from the timing run); `usrateHandlerv2`
+and `FXHistHandlerv2` both `rows: 0`, each verified correct rather than assumed:
+`FX_histdaily` already held 2026-10-01 from the live python3.10 handler, and the
+H.15 page carried only 09-24…09-30 against a 09-30 watermark (now §7).
+
+---
+
+## 2026-10-01 — first deploy of `fin-deep-data`: two CloudFormation failures fixed
+
+### Goal
+
+Deploy the new python3.13 service for the first time. `sls deploy` failed twice
+before succeeding; both causes were configuration, not handler code, and both are
+now structural rather than "remember to set this".
+
+### Root cause 1 — an empty `STATUS_EMAIL` rejected the whole SNS topic
+
+`CREATE_FAILED: StatusTopic (AWS::SNS::Topic)`, *"Invalid parameter: Endpoint"*.
+`StatusTopic` declared the address inline as a `Subscription` entry on the topic,
+with `Endpoint: ${env:STATUS_EMAIL}`, and `.env` shipped `STATUS_EMAIL=""`. SNS
+rejects a subscription with an empty endpoint, and because the subscription was a
+property of the topic, it took the topic — and so the whole stack — down with it.
+Who gets the report is a reporting detail and must not be able to block the topic
+the eight functions depend on.
+
+Confirmed from the timeline rather than assumed: the topic failed at 22:26:55 UTC
+and `.env` was edited at 22:30 UTC, i.e. the owner filled the address in *after*
+the failure, so the value really was empty at deploy time.
+
+### Root cause 2 — the account's Lambda concurrency quota is 10
+
+`CREATE_FAILED: OptChainEODLambdaFunction`, *"is not updatable with parameters
+provided"* (`NotUpdatable`), with the other seven functions cancelled.
+`optChainEOD` carried `reservedConcurrency: ${env:OPT_MAX_PARALLEL, 4}`;
+reserving concurrency requires ≥ 100 unreserved executions to remain, and
+`aws lambda get-account-settings` reports `ConcurrentExecutions: 10` for this
+account. No reservation value is accepted, so this was never a matter of lowering
+4. CloudFormation's message names neither concurrency nor the quota.
+
+### Implementation detail
+
+`Ops/fin-deep-data/serverless.yml`, two changes:
+
+1. the e-mail subscription became its own `AWS::SNS::Subscription` resource
+   guarded by a CloudFormation condition
+   (`HasStatusEmail: Fn::Not[Fn::Equals[${env:STATUS_EMAIL, ''}, '']]`), and
+   `StatusTopic` now carries no subscription properties. An empty value deploys a
+   working topic and no subscription; setting the value and redeploying adds one.
+   An `${env:...}` lookup is safe here, unlike in `enabled:` — `Fn::Equals`
+   compares the string exactly, and a wrong address surfaces as a never-confirmed
+   subscription, not as a silently armed schedule.
+2. `reservedConcurrency` is commented out, with the consequence written on the
+   line: nothing now caps parallel Yahoo traffic, and the `OPT_SHARDS` shards
+   draw from the same pool of 10 as the nine live `fin-cron-data` functions, so a
+   fan-out can throttle them. `optChainEOD`'s schedules stay `enabled: false`
+   until the quota is raised to 1000 and the line is restored — in that order.
+
+No handler code changed, and `Ops/fin-cron-data` was not touched.
+
+### Deployed state, verified against AWS rather than the deploy output
+
+Eight functions, all `python3.13`, with the designed layer sets (core only for
+`statusReport`; core+`finDeepYf` for the five downloaders; core+`finDeepWeb` for
+`portAssetsHandlerv2` and `usrateHandlerv2`); zips 11–72 KB. Eleven
+`AWS::Scheduler::Schedule` entries, **every one `DISABLED`**, every one
+`America/New_York`. One e-mail subscription, `PendingConfirmation`.
+
+Also found, reported and deliberately not fixed here: `UPSTREAM_R2_BUCKET` is
+still empty. `statusReport` wraps its R2 upload in `try/except`, so the e-mail
+still goes out and the run returns `r2: None`; `optChainEOD` uses `env_or` and
+only warns, so **the raw chain archive is silently skipped**.
+
+### Related files
+
+- `Ops/fin-deep-data/serverless.yml` — conditional SNS subscription;
+  `reservedConcurrency` commented out
+- `doc/OPERATIONS.md` — §8.3 and §8.4 (the two incidents, with the quota-raise
+  sequence); §8's two earlier incidents numbered 8.1/8.2; §10.4 records the first
+  deploy, its live verification commands and the corrected expected-render list;
+  four §9 troubleshooting rows
+- `TODOS.md` — 2.13, the concurrency quota, marked as blocking `optChainEOD`
+- `CLAUDE.md` — deployed-state note; the `optChainEOD` row no longer claims a
+  reservation
+
+### Test coverage
+
+No test added or removed: both failures were in CloudFormation rendering, which
+the suite does not and should not reach. The verification was instead a
+`serverless package` assertion on the rendered template, run **both ways** —
+with `STATUS_EMAIL` set (subscription resource present, condition
+`Fn::Equals[<address>, '']` false) and with `STATUS_EMAIL=""` forced (condition
+`Fn::Equals['', '']`, so CloudFormation skips the resource and the topic creates
+clean) — plus, after the deploy, the `aws scheduler get-schedule`,
+`aws lambda get-function-configuration` and `aws sns list-subscriptions-by-topic`
+checks recorded in §10.4. The existing suite still passes unchanged: **278
+passed, 1 skipped**.
+
+---
+
+## 2026-10-01 — `fin-deep-data`: PLAN-SR-UPSTREAM Phases A–F as a new python3.13 service
+
+### Goal
+
+Re-implement PLAN-SR-UPSTREAM Phases A–F under the constraints the owner set
+on 2026-10-01:
+
+1. no deployed function or layer of `Ops/fin-cron-data` changes;
+2. every new function runs on python3.13;
+3. all new files live in a new folder, `Ops/fin-deep-data`;
+4. one `serverless.yml` controls all of them, but each Lambda uploads only the
+   files it needs;
+5. Phase E's handler is named `portAssetsHandlerv2` and eventually replaces the
+   old one;
+6. a layer must stay inside a size ceiling of roughly 80 MB.
+
+The earlier (2026-09-25) implementation of these phases edited
+`Ops/fin-cron-data` in place and shared the `finPort313` layer. Constraint 1
+rules that out, so this is a re-implementation in a second Serverless service
+rather than a move of those files.
+
+### Root cause
+
+Not a bug fix. One behaviour of the earlier implementation was wrong and is
+corrected here: `port_assets_handler.py`'s `__main__` block passed
+`{"dbFlag": True}`, so the documented "dry run" wrote to production. See
+*Incident* below.
+
+### Implementation detail
+
+**A new service, not a move.** `Ops/fin-deep-data/` is a self-contained
+Serverless service (`service: fin-deep-data`) with its own `serverless.yml`,
+`.env`, `package.json`, `pytest.ini`, test tree and `dataUtil.py`. Nothing in
+`Ops/fin-cron-data/` is touched: `git status` shows no modification there, and
+the two services share no file, no layer and no `.env`.
+
+**`dataUtil.py` is a fork, not a copy by reference** (Phase A). Taken from
+`Ops/fin-cron-data/dataUtil.py` at `fa1d6ac` and extended with the Phase A
+helpers: `append_ignore` (INSERT IGNORE / INSERT OR IGNORE by dialect),
+`new_run_id` (hand-rolled 26-char ULID, no new dependency), `run_host`,
+`audit_frame` / `audit_run` / `audit_summary`, `shard_symbols`, `time_left_ok`,
+`day_start_utc`, `missing_for_sweep`, `require_env` / `env_or`, `utc_now`. The
+fork is python3.13 / SQLAlchemy 2.0 / pandas 2.2 only, though the helpers still
+use only APIs that exist on SQLAlchemy 1.4 so a later back-port needs no
+rewrite. One behavioural change beyond the helpers: `list_dir()` makes the three
+CSV loaders default to the module's own directory instead of resolving
+`PROD_LIST_DIR` or `"."` against the CWD, because the CSVs are packaged beside
+`dataUtil.py` in each function's zip.
+
+**Eight functions, one `serverless.yml`, eight zips.** `package: individually:
+true` with a `'!**'` baseline and a per-function allowlist. Measured package
+sizes: 11–71 KB each (`usrateHandlerv2` 11 KB, `optChainEOD` 71 KB), each
+carrying only the modules and CSVs that function imports or reads.
+
+| Function | Handler | Layers | Schedule (America/New_York) |
+|---|---|---|---|
+| eodDaily | `eod_daily_handler.run` | core + yf | 18:30 Mon–Fri, sweep 19:00 |
+| optChainEOD | `optchain_eod_handler.run` | core + yf | dispatch 17:40, sweeps 18:40 / 19:40 |
+| statusReport | `status_report_handler.run` | core | 20:00 Mon–Fri |
+| portAssetsHandlerv2 | `port_assets_handler.run` | core + web | 18:30 |
+| usrateHandlerv2 | `usrate_handler.run` | core + web | 17:05 |
+| FXHistHandlerv2 | `fxeod_handler.run` | core + yf | 17:10 |
+| yfus30minEODv2 | `intraday_min_handler.run_us` | core + yf | 20:05 |
+| yfasia30minEODv2 | `intraday_min_handler.run_asia` | core + yf | 06:00 |
+
+Every schedule above ships **disabled**; the times are when each fires once
+enabled.
+
+**All eleven schedules ship `enabled: false`** (owner's call, 2026-10-01): a
+deploy creates the eight functions and runs nothing, each is verified by manual
+invoke, then enabled on its own. The five v2 functions carry a second condition —
+each writes a table its still-live python3.10 counterpart writes, so enabling one
+before the old function is retired would put two writers on one table; that is
+the per-data-set cutover runbook in `doc/OPERATIONS.md` §11.2. Phases B–D's own
+data sets have no counterpart, so they are the three safe ones to enable first.
+
+`enabled` is a **literal** in `serverless.yml`, never an `${env:...}` lookup.
+Measured 2026-10-01 against `serverless package`: Serverless honours only the
+exact strings `false` and `true`, while an empty value, `0`, `yes` and `True`
+(capital T) all render `State: ENABLED`. The sole signal is a `must be boolean`
+config-validation warning, which this service suppresses because `python3.13`
+already warns and `configValidationMode: error` would block every deploy — so a
+one-character slip in `.env` would silently arm a schedule. A literal also makes
+each enablement a reviewable one-line diff.
+
+**Three layers instead of one** (constraint 6). `finPort313` is 164 MB
+unzipped / 49.5 MB zipped in one tree. Here the dependency set is split and
+de-duplicated by `Ops/fin-deep-data/build_layers.sh`:
+
+| Layer | Contents | Unzipped | Zipped | Mounted on |
+|---|---|---|---|---|
+| finDeepCore | pandas, numpy, SQLAlchemy, PyMySQL, python-dotenv, pytz, requests | 94 MB | 27 MB | all 8 |
+| finDeepYf | yfinance 0.2.58 + curl_cffi, peewee, frozendict, multitasking, platformdirs, bs4 | 10 MB | 3 MB | 5 |
+| finDeepWeb | lxml, beautifulsoup4, openpyxl | 14 MB | 6 MB | 2 |
+
+The build cross-builds for cp313/manylinux2014_x86_64, resolves the yf and web
+trees against `requirements_deep_core.txt` as a constraints file, then deletes
+every top-level entry `finDeepCore` already provides — without which yfinance
+drags in a second 100 MB copy of pandas/numpy. Pruning `tests/`, `__pycache__`
+and unneeded `.so` symbols takes the core tree from 124 MB to 94 MB. The script
+fails the build if a zip exceeds `LAYER_ZIP_MAX_MB` (80).
+
+Every zip is well inside the ceiling. The one number above 80 MB is
+finDeepCore *unzipped* at 94 MB: pandas (30) + numpy (22) + numpy.libs
+openBLAS (23) + tzdata/pytz (6) is the floor for this stack, and removing
+openBLAS would break `import numpy`. The AWS limit that matters — 250 MB
+unzipped for a function and all its layers — is met with room: the largest
+combination is core + web at 108 MB.
+
+**Phases B, C, D** are ports of the 2026-09-25 handlers, unchanged in logic
+(including every `# ported from myFinData@19c8509` comment), with the docstrings
+and the layer references updated and `__main__` fixed to a true dry run.
+
+**Phase E** keeps the 2026-09-25 DJIA/HSI work — `parse_djia_dia_holdings`
+(SSGA DIA holdings; the Wikipedia DJIA page no longer carries a ticker table),
+`normalize_hk_symbol`, `parse_hsi_wikipedia`, `stored_currency_rate`, bands
+30–30 and 50–110 — and deploys as `portAssetsHandlerv2`. `load_audit.job` stays
+`portAssetsHandler`: it names the data set's job, not the Lambda, so the status
+report does not grow a second line at the cutover, and `load_audit.host`
+records which function wrote the row. The same rule applies to the other four
+v2 functions (`usrateHandler`, `FXHistHandler`, `yfus30minEOD`,
+`yfasia30minEOD`).
+
+**Phase F could not edit the four python3.10 handlers** (constraint 1), so each
+is re-implemented as a v2 copy in this service, with the audit row and three
+small corrections:
+
+- `usrate_handler`: `pd.read_html` is given a `StringIO` (a literal HTML string
+  is deprecated in pandas 2.1+ and raises in 3.0); the empty-table fallback is
+  `dt.datetime(1800,1,1)`, fixing a `NameError` in the original; `{"dbFlag":
+  false}` writes `USrates_<date>.csv` instead of the table, which the original
+  had no way to do.
+- `fxeod_handler`: `localrun` comes from the event instead of a module global
+  only `__main__` could set.
+- `intraday_min_handler`: one module replaces the near-identical
+  `eoddata_minhandler_us.py` / `_asia.py` pair — they differed only in a stored
+  procedure name and the audit job name, so the market is a parameter
+  (`MARKETS`) and the two Lambdas point at `run_us` / `run_asia`. A symbol whose
+  exchange is missing from `Exchange_timezone.csv` is now skipped with a
+  warning; the originals indexed the map directly, so one unmapped exchange
+  raised `KeyError` and lost every symbol after it. `reshape_bars` is split out
+  as a pure function, `test: N` caps the symbol count for a dry run, and
+  `InitialRun` is passed down instead of mutating a module global.
+
+**Tests live with the service.** `Ops/fin-deep-data/pytest.ini` +
+`tests/` is a second pytest root, because both folders contain modules named
+`dataUtil` and `port_assets_handler` and only one of the two can be on
+`sys.path` in a session. The repo-root config collects `tests/` only, so it
+never reaches this tree and the existing suite is unaffected.
+
+### Incident — the Phase E dry run wrote to production
+
+Running `python port_assets_handler.py` as a dry run appended four real
+membership sets to `Trading.portfolio_assets_info` (SP500 503 rows dated
+2026-10-01, NDX100 101 @ 2026-09-30, DJI 30 @ 2026-09-29, HSI 85 @ 2026-10-01)
+plus one `load_audit` row, run_id `01M3VGEPHH8WD5ZY34HY8EJ45N`, host `ml3090`.
+
+Root cause: the `__main__` block carried over from 2026-09-25 passed
+`{"localrun": True, "dbFlag": True, "test": True}`, while `CLAUDE.md` documents
+this handler's dry run as `dbFlag: False`. `dbFlag=True` is the writing path,
+and an only-on-change handler treats a fresh scrape as a change.
+
+Blast radius: additive only — four point-in-time sets and one audit row, no
+delete and no overwrite. The data is correct (every sanity gate passed and each
+write verified its own row count). Because `current_symbols_V4` includes
+`portfolio_assets_info` members, the new DJI/HSI members now also appear in the
+list the eod and options jobs collect, which is what Phase E intends, just
+earlier than planned.
+
+Fix: `__main__` now passes `dbFlag: False` with a comment saying why, and the
+`__main__` block of all eight modules in this service was audited — every one is
+a dry run that touches no table. Rollback SQL, if the owner wants the rows gone,
+is in `doc/OPERATIONS.md` §8.
+
+### Related files
+
+- New: `Ops/fin-deep-data/` — `serverless.yml`, `dataUtil.py`,
+  `eod_daily_handler.py`, `optchain_eod_handler.py`, `status_report_handler.py`,
+  `port_assets_handler.py`, `usrate_handler.py`, `fxeod_handler.py`,
+  `intraday_min_handler.py`, `build_layers.sh`,
+  `requirements_deep_{core,yf,web}.txt`, `.env.example`, `.gitignore`,
+  `package.json`, `pytest.ini`, `README.md`, `sql/upstream_tables.sql`,
+  `stock_exchange.csv`, `Exchange_timezone.csv`, `intra_blacklist.csv`,
+  `tests/conftest.py`, `tests/fixtures/` (7 files), `tests/unit/` (6 files)
+- Modified: `Makefile` (three new targets, no existing target touched),
+  `CLAUDE.md`, `TODOS.md`, `PLAN-SR-UPSTREAM.md`, `doc/TECHNICAL-DESIGN.md`,
+  `doc/OPERATIONS.md`, `doc/API-REFERENCE.md`, `doc/PRODUCT-GUIDE.md`
+- Untouched, deliberately: everything under `Ops/fin-cron-data/`, every
+  `req_*.txt` and `requirements_cron.txt` / `requirements_port313.txt`,
+  `pytest.ini` and `tests/` at the repo root
+
+### Test coverage
+
+**Added** — `Ops/fin-deep-data/tests/unit/`, 278 passed / 1 skipped in the
+python3.13 venv (`venv-py313`, pandas 2.2.3 / SQLAlchemy 2.0.36 / numpy 2.1.3 /
+yfinance 0.2.58 — the exact layer pins). The one skip is
+`test_exec_sql_engine_execute_would_have_warned`, which cannot run on
+SQLAlchemy 2.x.
+
+- `test_dataUtil.py` — `ExecSQL` commit semantics on a real sqlite engine, plus
+  every Phase A helper: `append_ignore` (counts, first-value-wins, chunking,
+  MySQL vs sqlite verb, error swallowing), ULID shape and ordering,
+  `audit_frame` defaults / 512-char truncation / int dtypes, `audit_run`
+  swallowing its own failure, `shard_symbols`, `time_left_ok`,
+  `missing_for_sweep` returning `None` on an unreadable audit table.
+- `test_eod_daily_handler.py` — `exchange_for` (CSV / `^HSI` / suffix / blank),
+  `session_date`, `start_dates`, `plan_downloads` (batch vs single, tz grouping,
+  batch size, window boundary), `prepend_ranges`, `reshape_batch` against a
+  saved multi-ticker yfinance frame (NaN drop, column order, `Adj Close`
+  rename), `drop_partial_bar` at the 59/60-minute boundary in NY and HK,
+  `extract_actions`, audit rows per segment and status including `skipped` via a
+  fake context, pinned `yf.download` kwargs, and behaviour when
+  `EOD_WRITE_TBL` / `TBLLOADAUDIT` are **absent**.
+- `test_optchain_eod_handler.py` — `N_COLUMNS` set and dtypes,
+  `filter_opt_chain` at the `lastPrice` and OI-quantile edges, retry-then-empty,
+  `Section` / `contractSize` / `inTheMoney`, empty chain, per-underlying write,
+  time guard → `skipped`, sweep taking only missing symbols, dispatcher event
+  fan-out, `shards_needed`, and the R2 key.
+- `test_status_report_handler.py` — status rules including stale-on-Monday and
+  the on-change tables, shard aggregation, the `(inferred)` fallback, span
+  formatting, and the report layout.
+- `test_port_assets_handler.py` — the SP500 / NDX100 / DJIA / HSI parsers
+  against saved fixtures, sanity bands, `normalize_hk_symbol`,
+  `stored_currency_rate`, only-on-change logic, and the `load_audit` summary row.
+- `test_phase_f_handlers.py` — one summary-row test plus failure and
+  audit-failure paths for each of `usrateHandlerv2`, `FXHistHandlerv2`,
+  `yfus30minEODv2` and `yfasia30minEODv2`; `reshape_rates` (group rows dropped,
+  `n.a.` → NaN, float cast); `HTML2DataFrame` raising no pandas deprecation;
+  `reshape_bars` (local-naive `Datetime` with `UTCDatetime` kept, window
+  filter); the unmapped-exchange skip; `run_us` / `run_asia` market routing; and
+  `load_blacklist` not depending on the CWD.
+
+**Python 3.13 policy gate** — the whole suite re-run with
+`-W error::FutureWarning:<module> -W error::DeprecationWarning:<module>` for all
+eight modules: no warning from our own code. Every module also passes
+`py_compile` and a clean `import` from the service folder under python3.13.
+
+**Dry runs** (writes off, against the live MySQL and live sources):
+
+| Handler | Event | Result |
+|---|---|---|
+| `eod_daily_handler` | `{"localrun": true, "dbFlag": false, "test": 25}` | 25 symbols, 24 ok / 1 error (`0011.HK`, delisted at Yahoo), 72 bars × 9 columns with no nulls across 24 symbols, 5 dividends, 27 audit rows (24 append-ok, 1 first-error, 2 summary) |
+| `status_report_handler` | `{"localrun": true}` | 8 lines — 2 audited data sets from the live `v_load_status` + 6 inferred tables; `3 issue(s)` in the subject; no SNS and no R2 |
+| `port_assets_handler` | `{"localrun": true, "dbFlag": false, "test": true}` | SP500 503, NDX100 101, DJIA 30, HSI 85 rows; all four sanity gates inside band; four CSVs + the combined 719-row CSV; `action=skip (dbFlag=False)` for every index |
+| `usrate_handler` | `{"localrun": true, "dbFlag": false}` | H.15 scraped, 5 dates × 30 instrument rates, 0 rows newer than the stored max, no write |
+| `intraday_min_handler` (us, asia) | `{"localrun": true, "dbFlag": false, "test": 5}` | both markets run to completion, 10 per-symbol CSVs, exchange-local `Datetime` correct for NY and HK |
+| `fxeod_handler` | `{"localrun": true, "dbFlag": false}` | runs to completion with 0 rows: `FX_histdaily` is already loaded to 2026-09-30 and the local clock is before 17:00 ET, so start > end. Pre-existing semantics of this handler, not a regression — see `doc/OPERATIONS.md` §7 |
+| `optchain_eod_handler` | `{"localrun": true, "dbFlag": false}` | full-V4 timing run over all 857 underlyings: **`T_total` 1,948 s (32.5 min), `opt_shards_needed` 4**, confirming the 1,965 s measured on 2026-09-25 and the `OPT_SHARDS=4` already in `.env`. 615 ok / 208 empty / 34 error / 0 skipped; 458,772 raw contract rows filtered to 106,920 written rows, whose column list matches `N_COLUMNS` exactly and carries no repeated header from the per-underlying append. The 34 errors are delisted or no-data tickers and cost 814 s of the total — 25 s each in the ported 5 × 5 s retry loop — so they, not the live underlyings, are the single largest term in the sizing |
+
+**Config validation** — `serverless print` and `serverless package` both pass
+from `Ops/fin-deep-data/`. The rendered CloudFormation has eight
+`AWS::Lambda::Function` resources on `python3.13`, eleven
+`AWS::Scheduler::Schedule` resources all with
+`ScheduleExpressionTimezone: America/New_York` and all `State: DISABLED`
+(re-verified after the 2026-10-01 change: 11 schedules, 0 enabled),
+`ReservedConcurrentExecutions: 4` on `optChainEOD`, the
+`lambda:InvokeFunction` and `sns:Publish` statements, and
+`STATUS_TOPIC_ARN: {"Ref": "StatusTopic"}` on `statusReport`. The eight package
+zips contain exactly the allowlisted files. The `python3.13` validation
+*warning* is the known cosmetic one; `configValidationMode: error` stays
+commented out.
+
+**Layer validation** — all three layers cross-built and zipped by
+`./build_layers.sh`; sizes as tabled above; the dev venv `venv-py313` installs
+the same three requirement files and imports pandas, yfinance, SQLAlchemy,
+PyMySQL, lxml, openpyxl and bs4 under 3.13.15.
+
+**Tooling** — the layer-publish step needs the AWS CLI, which was not installed
+on this machine. Installed user-local (`~/.local/aws-cli`, v2.37.8) and verified:
+`aws sts get-caller-identity --profile ServerLessUser` returns
+`arn:aws:iam::567575054547:user/ServerLessUser`. `serverless deploy` itself does
+not need it — it reads `~/.aws/credentials` directly. A read-only `list-layers`
+confirmed the three `finDeep*` names are unused, and turned up a naming
+correction now recorded in `doc/OPERATIONS.md` §10.3: the published layers are
+`finCronLib` v5 and `finPortLib` v5, not `finCron` / `finPort313` as this repo's
+zip and requirements-file names suggest.
+
+**Layers published and verified** (owner published them 2026-10-01 21:36 UTC;
+verified here afterwards): `finDeepCore:1`, `finDeepYf:1`, `finDeepWeb:1`, all
+`python3.13`. Each layer's `CodeSha256` from `get-layer-version` equals the
+base64 SHA-256 of the local zip, so each published layer is byte-identical to
+what `build_layers.sh` produced and what the test suite ran against;
+`finDeepWeb:1` was additionally downloaded through its presigned URL and is
+`cmp`-identical to `finDeepWeb.zip`, with every entry under
+`python/lib/python3.13/site-packages/`. The three versioned ARNs are now in
+`Ops/fin-deep-data/.env` and render into every function's `layers:` list.
+Procedure: `doc/OPERATIONS.md` §10.3.1.
+
+**Not verified here** (owner steps, unchanged from the plan): confirming the SNS
+subscription e-mail, the account concurrency headroom check, the golden-CSV
+diff against `histdailyprice7` and the droplet's `OptionsChain/` samples, and
+the U5 shadow run.
+
+---
+
 ## 2026-08-02 — `portAssetsHandler`: fix `Runtime.MarshalError` on the return value
 
 ### Goal

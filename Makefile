@@ -61,6 +61,36 @@ finPort313.zip:
 	zip -r9 $@ python/
 	@echo "unzipped size: $$(du -sh python | cut -f1)  (Lambda limit: 250 MB unzipped, all layers combined)"
 
+# ---------------------------------------------------------------------------
+# fin-deep-data layers (python3.13) -- Ops/fin-deep-data.
+#
+# Three small layers instead of one big tree, so every zip stays well under the
+# 80 MB working ceiling and each function mounts only what it imports:
+#
+#   finDeepCore  pandas, numpy, SQLAlchemy, PyMySQL, python-dotenv, pytz,
+#                requests       101 MB unzipped / 29 MB zipped -- all 8 functions
+#   finDeepYf    yfinance 0.2.58 + deps   28 MB / 10 MB -- the downloaders
+#   finDeepWeb   lxml, bs4, openpyxl      14 MB /  6 MB -- the scrapers
+#
+# build_layers.sh does the cross-build for cp313/manylinux2014_x86_64, prunes
+# tests and debug symbols, and de-duplicates the yf and web trees against core
+# (so BUILD CORE FIRST). It fails the build if a zip exceeds 80 MB.
+#
+# These targets add nothing to and change nothing in finCron / finPort313.
+finDeep: finDeepCore.zip finDeepYf.zip finDeepWeb.zip
+
+finDeepCore.zip:
+	Ops/fin-deep-data/build_layers.sh core
+
+# No make-level dependency on finDeepCore.zip: these need core's *build tree*,
+# not its zip, and rebuilding core for every one of them would waste a minute
+# each time. The script stops with "build core first" if the tree is missing.
+finDeepYf.zip:
+	Ops/fin-deep-data/build_layers.sh yf
+
+finDeepWeb.zip:
+	Ops/fin-deep-data/build_layers.sh web
+
 finWebLib.zip: 
 	$(RM) -rf ./python
 	pip3 install -r req_Web.txt -t python/lib/python3.10/site-packages
@@ -92,4 +122,4 @@ config.zip:
 clean:
 	$(RM) -rf ./python config.zip myFinDataFull.zip
 
-.PHONY: all clean
+.PHONY: all clean finDeep finDeepCore.zip finDeepYf.zip finDeepWeb.zip

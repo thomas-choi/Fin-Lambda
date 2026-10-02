@@ -1,0 +1,12 @@
+# finDeepWeb -- HTML/XLSX scraping, for portAssetsHandlerv2 and usrateHandlerv2.
+#
+# Mounted ON TOP OF finDeepCore (pandas, requests). beautifulsoup4 also ships
+# in finDeepYf; a function that mounts both gets one copy, later layers losing
+# to earlier ones on the path -- the versions are pinned identical here so it
+# cannot matter.
+#
+# Build:  make finDeepWeb.zip
+
+lxml==5.3.0             # pandas.read_html parser
+beautifulsoup4==4.12.3  # read_html fallback flavour; usrateHandlerv2's H.15 scrape
+openpyxl==3.1.5         # SSGA SPY/DIA .xlsx holdings

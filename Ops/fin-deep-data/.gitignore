@@ -1,0 +1,19 @@
+# Dry-run artefacts. Every handler here writes its output to the CWD on a local
+# run (localrun / dbFlag=False), so running one from this folder leaves files
+# behind. None of them is a committed golden reference: they carry live market
+# data and change daily. The shapes a healthy dry run produces are recorded in
+# doc/OPERATIONS.md instead.
+eod_daily_*.csv
+corp_action_*.csv
+load_audit_*.csv
+options_eod_*.csv
+optchain_timing_*.csv
+OptionsChain/
+30min_*.csv
+USD_dailyFX.csv
+USrates_*.csv
+portfolio_assets_info*.csv
+
+# Serverless / npm
+.serverless/
+node_modules/

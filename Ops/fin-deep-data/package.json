@@ -1,0 +1,8 @@
+{
+  "name": "fin-deep-data",
+  "private": true,
+  "description": "Serverless service for the PLAN-SR-UPSTREAM python3.13 collectors. Node deps are build-time only (the dotenv plugin); nothing here ships to Lambda.",
+  "devDependencies": {
+    "serverless-dotenv-plugin": "^6.0.0"
+  }
+}

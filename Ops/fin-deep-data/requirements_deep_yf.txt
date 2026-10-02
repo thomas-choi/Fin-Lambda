@@ -1,0 +1,20 @@
+# finDeepYf -- yfinance, for the functions that download market data:
+# eodDaily, optChainEOD, FXHistHandlerv2, yfus30minEODv2, yfasia30minEODv2.
+#
+# Mounted ON TOP OF finDeepCore, which already provides pandas, numpy, pytz
+# and requests -- they are intentionally not repeated here.
+#
+# yfinance is pinned to the version production myFinData and the finCron layer
+# run (0.2.58). yfinance declares only lower bounds on its own dependencies,
+# so they are pinned to 2025-era releases rather than newest (peewee 4.x and
+# curl_cffi 0.16 both postdate 0.2.58). All are cp313 or pure-python wheels.
+#
+# Build:  make finDeepYf.zip
+
+yfinance==0.2.58
+curl_cffi==0.11.4       # abi3 wheel; yfinance's HTTP session
+peewee==3.19.0          # yfinance tz/cookie cache; kept below 4.x
+frozendict==2.4.7
+multitasking==0.0.11
+platformdirs==4.3.8
+beautifulsoup4==4.12.3  # yfinance parses the quote pages with it

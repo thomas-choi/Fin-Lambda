@@ -11,8 +11,13 @@ parses. Those *are* its API.
 
 ## Changelog
 
+- 2026-10-01 | Modified | §4 `load_symbols_db` takes `sym_type` (V5's `@type`) and §7 adds `symbol_proc_type`; §7 the `eodDaily` and `optChainEOD` event contracts gain `symType` and name the procedure their `symbols` default comes from.
+- 2026-10-01 | Added | §7 the `current_symbols_V5` call contract — argument values, which handler sends which, and the result column the caller reads.
+- 2026-10-01 | Added | §4 `dataUtil.out_dir()` / `on_lambda()` in the function reference. `localrun` no longer changes the output directory on Lambda — it is always under `/tmp`.
 - 2026-08-01 | Added | Initial file: per-handler event contracts, `portAssetsHandler` in full, `dataUtil` function reference incl. `ExecSQL`'s changed return type, `portfolio_assets_info` column reference, source-payload shapes.
 - 2026-08-02 | Modified | §1 `portAssetsHandler` return value: now a JSON-serialisable list — `frame` is no longer returned and `date` is an ISO-8601 string, not a `datetime.date`.
+- 2026-10-01 | Added | §7 the `fin-deep-data` contracts: event contracts for the eight python3.13 functions, the Phase A `dataUtil` helpers, the `load_audit` / `corp_action_daily` / `v_load_status` columns and their SR contract, and the R2 key layout for raw option chains and the status JSON.
+- 2026-10-01 | Modified | §1 *Other handlers* now points at §7 for the v2 successors and notes which event keys differ there.
 
 ---
 
@@ -89,6 +94,12 @@ python port_assets_handler.py     # __main__ supplies {"localrun": True, "dbFlag
 > The dry-run switch is **not uniform**. Check the handler before running one
 > against production — see `doc/OPERATIONS.md` §6.
 
+The `fin-deep-data` service has its own, *uniform* contract: `dbFlag` is the
+off-switch on every handler and `localrun` only chooses where output files go.
+Its eight functions are in §7, including the v2 successors of
+`eoddata_minhandler_*`, `fxeod_handler`, `usrate_handler` and
+`port_assets_handler`, whose event keys differ from the rows above.
+
 ---
 
 ## 2. `dataUtil` function reference
@@ -107,7 +118,7 @@ python port_assets_handler.py     # __main__ supplies {"localrun": True, "dbFlag
 | `get_Last_Date_by_Sym(tblname, sym)` | `date` | Falls back to `FIRSTTRAINDTE` when the table is empty |
 | `get_Last_Datetime_by_Sym(tblname, sym)` | `datetime` | |
 | `load_symbols(symlistName, ver="V3")` | `list` \| `None` | `"system"` routes to the `current_symbols_V3` stored procedure |
-| `load_symbols_db(ver="V3")` | `list` | |
+| `load_symbols_db(ver="V3", sym_type=None)` | `list` | `CALL GlobalMarketData.current_symbols_{ver}`. `sym_type` is sent only for versions outside `UNTYPED_SYMBOL_PROCS` = {`V1`,`V2`,`V3`,`V4`} — those take no argument and passing one is a SQL error. Raises `AttributeError` when the call fails, because `load_df_SQL` returns `None` |
 | `load_symbols_dict()` | `dict` \| `None` | symbol → exchange, from `stock_exchange.csv` |
 | `load_exchange_tz()` | `dict` \| `None` | exchange → timezone, from `Exchange_timezone.csv` |
 | `load_eod_price(ticker, start, end)` | `DataFrame` \| `None` | |
@@ -255,3 +266,234 @@ Written by `yfNewshandler` only.
 > scripts present cannot run in this environment — `dataUtil_Pgsql.py` hardcodes
 > an absolute macOS dotenv path and reads a different key set (`RHOST`, `DB`,
 > `PORT`). Do not deploy it as-is.
+
+---
+
+## 7. `fin-deep-data` contracts (python3.13)
+
+`Ops/fin-deep-data/`, added 2026-10-01. Unlike §1, the off-switch is uniform:
+**`dbFlag: false` suppresses every database, R2 and `load_audit` write** on every
+handler here, and `localrun` only decides whether output files go to the CWD or
+`/tmp`.
+
+### 7.1 Event contracts
+
+All eight are invoked as `run(event, context)` and return a JSON-serialisable
+dict (or, for `portAssetsHandlerv2`, a list of dicts). EventBridge passes `{}`
+or the `input` block declared in `serverless.yml`, so every key has a safe
+default.
+
+**`eodDaily` — `eod_daily_handler.run`**
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `localrun` | bool | `False` | CSVs to the CWD instead of `/tmp` |
+| `dbFlag` | bool | `True` | `False` → no table and no audit writes; writes `eod_daily_<asof>.csv`, `corp_action_<asof>.csv`, `load_audit_<asof>.csv` |
+| `shard` / `of` | int | `0` / `1` | round-robin slice of the sorted symbol list |
+| `sweep` | bool | `False` | process only symbols with no `ok`/`empty` audit row for `asof` |
+| `prepend` | bool | `False` | U2b: download `[FIRSTTRAINDTE, MIN(Date)−1]` per symbol, `segment='prepend'` |
+| `asof` | `YYYY-MM-DD` | NY date, minus a day before 09:00 | session date |
+| `symbols` | list | from `current_symbols_{SYMBOL_PROC_VER}` | list override; skips the procedure entirely |
+| `symType` | `'a'` \| `'o'` | `'a'` | V5's `@type`. Ignored by V1–V4, which take no argument. Unrecognised values fall back to `'a'` |
+| `test` | int \| bool | — | int caps the symbol count; any truthy value sets DEBUG logging |
+| `NYTIME` | datetime | now in NY | injected clock, for tests |
+
+Returns `{run_id, asof, mode, dbFlag, rows_written, actions_written, status,
+error, n_expected, n_ok, n_empty, n_error, n_skipped}`.
+
+**`optChainEOD` — `optchain_eod_handler.run`**
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `dispatch` | bool | `False` | async-invoke this function `OPT_SHARDS` times with `{shard, of, asof}` and return |
+| `shard` / `of` | int | `0` / `1` | round-robin slice |
+| `sweep` | bool | `False` | only underlyings missing an `ok`/`empty` audit row |
+| `asof` | `YYYY-MM-DD` | NY date, minus a day before 09:00 | `Date` written on every row |
+| `symbols` | list | from `current_symbols_{SYMBOL_PROC_VER}` | list override; skips the procedure entirely |
+| `symType` | `'a'` \| `'o'` | `'o'` | V5's `@type`; `'o'` also excludes `SymbolMaster.options = 0`. Ignored by V1–V4 |
+| `localrun` / `dbFlag` | bool | `False` / `True` | `dbFlag=False` → no table, no R2; CSVs plus `optchain_timing_<date>.csv` |
+| `test` | int \| bool | — | int caps the symbol count; truthy sets DEBUG |
+| `NYTIME` | datetime | now in NY | injected clock |
+
+Returns `{run_id, asof, mode, dbFlag, rows_written, status, error, n_expected,
+n_ok, n_empty, n_error, n_skipped, seconds, opt_shards_needed}`; a dispatch run
+returns `{mode: "dispatch", asof, shards, started, events}`.
+
+**`statusReport` — `status_report_handler.run`**
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `localrun` | bool | `False` | print only — no SNS, no R2 |
+| `dbFlag` | bool | `True` | `False` behaves like `localrun` |
+| `asof` | `YYYY-MM-DD` | today in NY | report date, used for the staleness test |
+| `test` | bool | `False` | DEBUG logging |
+| `NYTIME` | datetime | now in NY | injected clock |
+
+Returns `{asof, subject, lines, statuses, error, sns, r2}`.
+
+**`portAssetsHandlerv2` — `port_assets_handler.run`** — same contract as
+`portAssetsHandler` in §1 (`localrun`, `dbFlag`, `force`, `test`, `NYTIME`) and
+the same JSON-safe list return, with two more entries in it: `DJIA` and `HSI`.
+
+**`usrateHandlerv2` — `usrate_handler.run`**
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `dbFlag` | bool | `True` | `False` → `USrates_<date>.csv` instead of the table, and no audit row |
+| `localrun` | bool | `False` | CSV to the CWD instead of `/tmp` |
+| `test` | bool | `False` | DEBUG logging |
+
+Returns `{run_id, rows}`. **Changed from `usrate_handler.run`**, which accepted
+`test` only and had no way to suppress a write.
+
+**`FXHistHandlerv2` — `fxeod_handler.run`**
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `localrun` | bool | `False` | `USD_dailyFX.csv` only; implies no table and no audit row |
+| `dbFlag` | bool | `True` | `False` → same as `localrun` |
+| `test` | any | — | DEBUG logging |
+| `NYTIME` | datetime | now in NY | injected clock |
+
+Returns `{run_id, rows}`. **Changed from `fxeod_handler.run`**, where the dry run
+was a module-global `localrun` only `__main__` could set.
+
+**`yfus30minEODv2` / `yfasia30minEODv2` — `intraday_min_handler.run_us` /
+`.run_asia`**
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `localrun` | bool | `False` | per-symbol `30min_<sym>.csv` |
+| `dbFlag` | bool | `True` | `False` → no table and no audit row |
+| `InitialRun` | bool | `False` | full available history instead of the watermark (yfinance caps intraday at 60 days) |
+| `test` | int \| bool | — | **new**: int caps the symbol count; truthy sets DEBUG |
+
+Returns `{run_id, market, job, rows}`. The underlying `run(event, context,
+market="us")` takes the market as a third argument; the two Lambda entry points
+are thin wrappers so one module serves both functions.
+
+### 7.2 Phase A `dataUtil` helpers
+
+In `Ops/fin-deep-data/dataUtil.py` only — the `fin-cron-data` copy does not have
+them. Error contract as elsewhere in that module: log and return `None`, except
+where noted.
+
+| Signature | Returns | Notes |
+|---|---|---|
+| `append_ignore(df, schema, table, chunk=500)` | `int` rows inserted \| `None` | `INSERT IGNORE` / `INSERT OR IGNORE` by dialect. Target table must exist |
+| `audit_run(rows)` | `int` \| `None` | writes `load_audit`; swallows **all** errors, including a missing `TBLLOADAUDIT` |
+| `audit_frame(rows)` | `DataFrame` | pure; `AUDIT_COLUMNS` order, `error` cut to 512 chars |
+| `audit_summary(job, table_name, run_id, started_at, status='ok', n_rows=0, date_lo=None, date_hi=None, n_ok=None, n_expected=None, error=None, yf_version='', finished_at=None)` | `dict` | the `Symbol='*'`, `segment='summary'` row |
+| `new_run_id(now_ms=None)` | `str` (26) | Crockford base32 ULID, sorts by time |
+| `run_host()` | `str` (≤64) | `lambda:<function>` or the hostname |
+| `shard_symbols(symbols, i, n)` | `list` | **raises** `ValueError` on `i` outside `0..n-1` |
+| `time_left_ok(context, reserve_ms=120_000)` | `bool` | `True` when `context` is `None` |
+| `missing_for_sweep(job, date, expected, table_name, tz='America/New_York')` | `list` \| `None` | `None` when `load_audit` is unreadable — callers must not treat that as "nothing done" |
+| `require_env(name)` | `str` | **raises** `RuntimeError` when unset or blank |
+| `env_or(name, default)` | `str` | blank counts as unset |
+| `utc_now()` | tz-naive `datetime` | UTC |
+| `day_start_utc(day, tz='America/New_York')` | tz-naive `datetime` | local midnight as UTC |
+| `out_dir(localrun=False, env_key=None)` | `str` | `/tmp` (or a `/tmp` subdirectory named by `env_key`) whenever `AWS_LAMBDA_FUNCTION_NAME` is set; `"."` for a local `localrun`; otherwise `env_key`'s value or `"."`. Creates the directory. Never returns a path that is read-only on Lambda |
+| `on_lambda()` | `bool` | Whether `AWS_LAMBDA_FUNCTION_NAME` is set |
+| `symbol_proc_type(sym_type)` | `'a'` \| `'o'` | Pure. `None`, `''`, whitespace and anything unrecognised become `'a'`; case and surrounding spaces are ignored. The only value interpolated into the `CALL`, so a bad `symType` cannot reach SQL |
+| `list_dir()` | `str` | `PROD_LIST_DIR`, else this module's directory. **Behaviour change** vs. the `fin-cron-data` copy, which resolves `"."` against the CWD |
+
+### 7.2.1 `GlobalMarketData.current_symbols_V5` call contract
+
+```
+CALL GlobalMarketData.current_symbols_V5('a')   -- eodDaily
+CALL GlobalMarketData.current_symbols_V5('o')   -- optChainEOD
+```
+
+| | |
+|---|---|
+| Argument | `IN p_type CHAR(1)`. **Required** — MySQL has no default argument values, so `CALL …_V5()` is an error. `NULL`, `''` and any value other than `'o'` are treated as `'a'` inside the procedure as well as in `dataUtil.symbol_proc_type` |
+| `'a'` | V4's union minus `SymbolMaster.delisted = 1`. 838 rows on 2026-10-01 |
+| `'o'` | also minus `SymbolMaster.options = 0`. 814 rows on 2026-10-01 |
+| Result set | one column, **`Symbol`** (`varchar(20)`), `DISTINCT`, `ORDER BY Symbol`. `load_symbols_db` reads `df.Symbol`, so a renamed column raises `AttributeError` |
+| Not a whitelist | a symbol absent from `SymbolMaster` is returned by both types — 648 of the 863 union symbols are in that position |
+| Version switch | `SYMBOL_PROC_VER`. `V1`–`V4` take no argument and `load_symbols_db` withholds the type; `V5` and anything later receive it |
+
+> **Note:** DDL in `Ops/fin-deep-data/sql/current_symbols_V5.sql`; row counts read
+> off the live database on 2026-10-01, not from DDL.
+
+### 7.3 `GlobalMarketData.load_audit`
+
+> **Note:** DDL in `Ops/fin-deep-data/sql/upstream_tables.sql`. This is the
+> contract Support-Resistance-Agent reads (`available_at` comes from
+> `finished_at`).
+
+| Column | Type | Meaning |
+|---|---|---|
+| `run_id` | `CHAR(26)` | ULID of the invocation |
+| `job` | `VARCHAR(32)` | the **data set's** job: `eodDaily`, `optChainEOD`, `usrateHandler`, `FXHistHandler`, `yfus30minEOD`, `yfasia30minEOD`, `portAssetsHandler`. Not the Lambda's name — a v2 function writes the same value as the function it replaces |
+| `Symbol` | `VARCHAR(45)` | `'*'` on a summary row |
+| `Exchange` | `VARCHAR(45)` | `''` on summary rows and where the handler has no exchange concept |
+| `date_lo` / `date_hi` | `DATE` null | first and last trade date written |
+| `table_name` | `VARCHAR(64)` | the data set, e.g. `histdailyprice7_shadow`. `DataName` in the status report |
+| `segment` | `VARCHAR(8)` | `first` \| `append` \| `prepend` \| `summary` |
+| `n_rows` | `INT` | rows this handler **built** for this symbol or run |
+| `n_ok` / `n_expected` | `INT` null | summary rows only: symbols ok/empty, and symbols this shard was given |
+| `status` | `VARCHAR(16)` | `ok` \| `empty` \| `error` \| `skipped` |
+| `error` | `VARCHAR(512)` null | truncated by the writer; `STRICT_ALL_TABLES` would reject a longer value |
+| `started_at` / `finished_at` | `DATETIME(3)` | UTC. `finished_at` is SR's `available_at` |
+| `yf_version` | `VARCHAR(16)` | `''` for handlers that do not use yfinance |
+| `host` | `VARCHAR(64)` | `lambda:<function name>` or the hostname — this is what distinguishes a v2 writer |
+
+Primary key `(run_id, table_name, Symbol, Exchange)`. **Deviation** from SR tech
+doc §4.5.7's `(run_id, Symbol, Exchange)`: one `eodDaily` invocation writes two
+data sets and needs a summary row for each, and under SR's key the second would
+be dropped by `INSERT IGNORE`. SR's docs and its PK assertion need the matching
+amendment. Indexes: `(job, date_hi)` for `missing_for_sweep`,
+`(table_name, finished_at)` for `v_load_status` and SR's `available_at` lookup.
+
+Rows are written with `INSERT IGNORE` and **never updated**: a sweep adds a new
+row rather than correcting the shard's `skipped` row, so a symbol can have
+several rows per day and "did it succeed" means *any* row is `ok`/`empty`.
+
+### 7.4 `GlobalMarketData.corp_action_daily`
+
+| Column | Type | Meaning |
+|---|---|---|
+| `Date` | `DATE` | ex-date, exchange-local |
+| `Symbol` | `VARCHAR(45)` | |
+| `Exchange` | `VARCHAR(45)` | |
+| `Dividends` | `DOUBLE` null | cash per share, in the traded units of that date |
+| `StockSplits` | `DOUBLE` null | ratio, new/old |
+| `first_seen_at` | `DATETIME(3)` | UTC; `INSERT IGNORE` on the PK keeps the **first** sighting, which makes this an honest `available_at` |
+| `run_id` | `CHAR(26)` | `load_audit.run_id` of the sighting run |
+
+Primary key `(Date, Symbol, Exchange)`.
+
+### 7.5 `GlobalMarketData.v_load_status`
+
+One row per `(table_name, job)` — the latest `segment='summary'` row by
+`finished_at`, via `ROW_NUMBER()`. Columns: `table_name, job, last_data_date,
+started_at, finished_at, status, n_ok, n_expected, n_rows, error`. Read by
+`statusReport` and by SR's `sr status`. A read-only consumer needs `SELECT` on
+the view only.
+
+### 7.6 Write targets
+
+| Env var | Shadow value | Production value | Written by |
+|---|---|---|---|
+| `EOD_WRITE_TBL` | `histdailyprice7_shadow` | `histdailyprice7` | eodDaily |
+| `OPT_WRITE_TBL` | `OptionChains_shadow` | `OptionChains` | optChainEOD |
+
+Both are **required with no fallback** — the cutover is deliberately an env-var
+flip, and a defaulted value could silently write to the wrong table. Columns
+match the production tables exactly (`CREATE TABLE … LIKE`): eodDaily writes
+`Date, Symbol, Exchange, Close, Open, High, Low, Volume, AdjClose`, and
+optChainEOD writes the 20 `N_COLUMNS` of the ported job, in that order.
+
+### 7.7 R2 key layout
+
+| Key | Written by | Content |
+|---|---|---|
+| `{OPT_RAW_PREFIX}/{YYYY-MM-DD}/{sym}-PM.csv` | optChainEOD | the **unfiltered** chain for one underlying, as downloaded, CSV |
+| `{STATUS_R2_KEY}` (default `status/latest.json`) | statusReport | `{asof, generated_at, rows: [...]}`, overwritten each run |
+
+Bucket `UPSTREAM_R2_BUCKET`, credentials `R2_ENDPOINT` / `R2_ACCESS_KEY_ID` /
+`R2_SECRET_ACCESS_KEY` (the `yf-news-collect` credentials reused). With the
+bucket unset, optChainEOD logs a warning and still writes its tables — the raw
+archive is best-effort, the database write is not.

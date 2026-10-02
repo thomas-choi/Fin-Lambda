@@ -56,12 +56,14 @@ Every handler routes through it, so these tests protect all of them at once.
 
 ## 2. Per-handler backlog
 
-All nine deployed functions currently have zero tests. Ordered by risk × how much pure logic is extractable.
+All nine `Ops/fin-cron-data` functions currently have zero tests. Ordered by risk × how much pure logic is extractable.
+
+> **2026-10-01.** Rows 2.1, 2.2, 2.4 and 2.7 are **covered for the python3.13 successors** in `Ops/fin-deep-data/tests/unit/test_phase_f_handlers.py` — `intraday_min_handler` (the merged replacement for 2.1 + 2.2; 2.2's "decide first" question is answered there: extracted into one module, tested once), `fxeod_handler` and `usrate_handler`. The rows stay open for the python3.10 copies still deployed, and close when §5.9 cuts those over.
 
 | # | Handler | Pure logic worth unit-testing | Status |
 |---|---|---|---|
 | 2.1 | `eoddata_minhandler_us.py` | `check_exchange_from_ticker()`, `yf_exchange_code()` fallback, `yf_get_max_datetime()` 59-day fallback, blacklist subtraction, tz localize/convert, the `(Datetime > sdatetime) & (<= edatetime)` window filter, and the `len(sDF) > 100 and dbFlag` branch that decides per-symbol vs. batched writes | TODO |
-| 2.2 | `eoddata_minhandler_asia.py` | Near-identical to 2.1 — differs only in `load_asia_symbols()`. **Decide first:** extract the shared body into one module and test once, or duplicate the tests. Extraction is preferred but touches deployed code | TODO |
+| 2.2 | `eoddata_minhandler_asia.py` | Near-identical to 2.1 — differs only in `load_asia_symbols()`. **Decide first:** extract the shared body into one module and test once, or duplicate the tests. Extraction is preferred but touches deployed code | **ANSWERED** 2026-10-01 — extracted in `Ops/fin-deep-data/intraday_min_handler.py` (market as a parameter, two entry points) and tested once. The 3.10 pair is left untouched and retires at §5.9 |
 | 2.3 | `opt_handler.py` | `keyformat()`, expired-contract filtering (`today > expiration`), `KEY` de-duplication, the dtype-coercion block, and the empty-`option_chain` path | TODO |
 | 2.4 | `fxeod_handler.py` | The **5 PM rollover rule** (`current_time < today5PM` → use previous day) including the boundary, watermark start-date selection vs. `FIRSTTRAINDTE`, ticker → `target_cur` split on `=`, and the empty-result path | TODO |
 | 2.5 | `handler.py` | `run()`'s 09:30–16:00 NY-time branch (use `freezegun`; assert both sides), and `yf_stk_run()`'s yfinance-`info` → market-row mapping including missing fields. Note `stk_run()` (DDS path) is dead code — decide delete vs. test | TODO |
@@ -71,6 +73,8 @@ All nine deployed functions currently have zero tests. Ordered by risk × how mu
 | 2.9 | `fff_handler.py` | Max-date filtering of new factor rows. **See 4.1 — this handler is currently broken; fix before testing** | TODO |
 | 2.10 | `DDSClient.py` | `convertRecord()` field-code → name mapping, malformed/short message handling. Pure string parsing, no socket needed | TODO |
 | 2.11 | `port_assets_handler.py` | **DONE** 2026-08-01 — `tests/unit/test_port_assets_handler.py`, 87 tests (T1–T14). Shipped with the handler, per the working agreement |
+| 2.12 | Both intraday handlers: with `SYMBOLLIST` unset, `run()` loops over `["stock_list", "etf_list", "crypto_list", "us-cn_stock_list"]` but `load_*_symbols()` ignores `list_name` — so the **same symbol list is downloaded four times**, quadrupling the Yahoo traffic. Either make the four names select real lists or drop the loop. `fin-deep-data`'s copy documents it and `.env.example` keeps `SYMBOLLIST` set as the workaround | TODO |
+| 2.13 | **Account Lambda concurrency quota is 10** (`aws lambda get-account-settings`, us-east-2, 2026-10-01), so `reservedConcurrency` cannot be set at all — it needs ≥ 100 unreserved to remain. `optChainEOD`'s cap is commented out in `Ops/fin-deep-data/serverless.yml` to let the service deploy, which leaves nothing limiting how many shards hit Yahoo at once and lets a fan-out throttle the nine live `fin-cron-data` functions out of the same pool of 10. Request `ConcurrentExecutions` → 1000 (Service Quotas `L-B99A9384`), restore the line, redeploy, confirm `ReservedConcurrentExecutions: 4`, **then** enable the schedules. Detail and the failure signature: `doc/OPERATIONS.md` §8.4 | TODO — **blocks enabling `optChainEOD`** |
 
 ---
 
@@ -116,7 +120,9 @@ that change.
 
 ## 5. Runtime upgrade — deadline-driven
 
-**AWS Lambda drops support for `python3.10` before October 2026.** Every function in this repo runs on it. Once the runtime is deprecated, existing functions keep executing for a grace period but **can no longer be updated or redeployed** — so this blocks all future deploys, not just new work. Confirm the exact block-update and block-create dates on the AWS Lambda runtime deprecation page before planning the window; the dates below are the constraint as understood today, not a quote from AWS.
+> **Update 2026-10-01.** `Ops/fin-deep-data` is the python3.13 service and the migration target pattern: eight functions, three cross-built cp313 layers, and a `dataUtil.py` fork proven on pandas 2.2.3 / SQLAlchemy 2.0.36 / numpy 2.1.3. Five of its functions (`portAssetsHandlerv2`, `usrateHandlerv2`, `FXHistHandlerv2`, `yfus30minEODv2`, `yfasia30minEODv2`) are **already 3.13 ports** of five of the nine python3.10 handlers, with their schedules disabled pending per-data-set cutover — so for those five, 5.2/5.5/5.7 reduce to running the cutover in `doc/OPERATIONS.md` §11. The remaining python3.10 functions to deal with are `cronHandler`, `optHandler`, `fffHandler`, `FXrateHandler` and `yfNewshandler`. All new development targets 3.13 and lands in `fin-deep-data`.
+
+**AWS Lambda drops support for `python3.10` before October 2026.** Nine functions in `Ops/fin-cron-data` run on it. Once the runtime is deprecated, existing functions keep executing for a grace period but **can no longer be updated or redeployed** — so this blocks all future deploys, not just new work. Confirm the exact block-update and block-create dates on the AWS Lambda runtime deprecation page before planning the window; the dates below are the constraint as understood today, not a quote from AWS.
 
 | # | Item | Status |
 |---|---|---|
@@ -127,7 +133,10 @@ that change.
 | 5.5 | Rebuild and re-upload every layer (`finCron` first; `finWebLib`/`finSvrLib`/`finVisLib`/`finDataLib` if still in use), then redeploy all nine functions | TODO |
 | 5.6 | `buildspec.yml` pins `python: 3.8`, which is **already** past EOL. Decide whether the legacy CodeBuild path (`lambda_function.py`, `eod_usrate.py`, `fin-Lambda-fun`) is still live — retire it if not, rather than migrating it | TODO |
 | 5.7 | Re-run the full dry-run set on the new runtime and diff against the golden CSVs (§3.5). A pandas 2.x bump is exactly the kind of change that silently alters dtypes and timezone handling in stored data | TODO |
-| 5.8 | Update the pinned versions listed in `CLAUDE.md` (*Build & deploy* and §3.4's import check) once the target is settled | TODO |
+| 5.8 | Update the pinned versions listed in `CLAUDE.md` (*Build & deploy* and §3.4's import check) once the target is settled | **DONE** 2026-10-01 for the 3.13 service — `CLAUDE.md` now lists both pin sets and both venvs. Still TODO for whatever target the five remaining 3.10 functions move to |
+| 5.9 | Cut over the five data sets that already have a 3.13 successor, one at a time, per `doc/OPERATIONS.md` §11.2: disable the `fin-cron-data` function, enable the v2 schedule, verify the next run | TODO — the v2 functions are written and tested; only the flip is left |
+| 5.10 | Port the five remaining python3.10 functions (`cronHandler`, `optHandler`, `fffHandler`, `FXrateHandler`, `yfNewshandler`) into `fin-deep-data`. `cronHandler` and `optHandler` are the hard ones: `DDSClient.py`'s raw TCP client and the options snapshot's stored-procedure dependencies. Fix §4.1 (`fff_handler`) as part of its port rather than before it | TODO |
+| 5.11 | Once nothing is left on `finCron`, delete the layer and the nine function definitions rather than leaving them deployed and unscheduled | TODO |
 
 > The test suite is the safety net for this migration. §3.4 (import check under pinned versions) and §3.5 (golden-CSV diff) are what turn a pandas 2.x bump from a gamble into a verifiable change — worth having in place *before* 5.2, not after.
 
@@ -142,4 +151,6 @@ that change.
 5. 2.1 → 2.4 → 2.3 (intraday, FX EOD, options) — the handlers with real date/timezone logic, where a silent bug corrupts stored history.
 6. 3.3 + 3.6 (env completeness + `.env.example`) — cheap, catches a whole failure class.
 7. 3.4 + 3.5, then the rest of section 5 — get the import and golden-CSV checks in place, then do the runtime move behind them.
-8. Remaining handlers as they are next touched, per the working agreement at the top.
+8. 5.9 (cut over the five data sets that already have a v2) — the work is done, only the flip remains.
+9. 5.10 (port the last five functions to 3.13) — this is what closes section 5.
+10. Remaining handlers as they are next touched, per the working agreement at the top.

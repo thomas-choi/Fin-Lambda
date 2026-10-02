@@ -1,0 +1,366 @@
+# fin-deep-data -- the python3.13 upstream collectors (PLAN-SR-UPSTREAM A-F).
+#
+# A SEPARATE service from fin-cron-data on purpose: nothing here changes a
+# deployed function or a layer of that service. `serverless deploy` in this
+# folder can only create or update the functions declared below.
+#
+# EVERY SCHEDULE IN THIS FILE SHIPS `enabled: false`.
+#
+# Deploying this service creates the functions and their schedules but runs
+# nothing: each one is verified by hand first, then enabled on its own. To enable
+# one, set `enabled: true` on that function's schedule(s) and redeploy -- a
+# one-line, reviewable diff. Verification procedure and the per-data-set order:
+# doc/OPERATIONS.md 10.4 and 11.
+#
+# Do NOT make `enabled` an ${env:...} lookup. Tested 2026-10-01: Serverless only
+# honours the exact literal strings `false`/`true`; an empty value, `0`, `yes` or
+# even `True` renders State: ENABLED, and the only signal is a config-validation
+# warning that this service suppresses (see configValidationMode below). A typo
+# in .env would silently arm a schedule.
+#
+# Five functions (portAssetsHandlerv2, usrateHandlerv2, FXHistHandlerv2,
+# yfus30minEODv2, yfasia30minEODv2) are python3.13 successors to functions still
+# live in fin-cron-data that write the same tables. For those, enabling the
+# schedule is only safe once the old function has been retired -- two writers on
+# one table duplicate rows. That is the cutover runbook in doc/OPERATIONS.md 11.2.
+#
+# Packaging: `individually: true` plus a per-function allowlist, so each zip
+# carries only the modules and CSVs that function imports or reads -- see the
+# `package.patterns` block on each one.
+
+service: fin-deep-data
+
+# Leave this commented out. Serverless Framework 3.x's runtime allowlist stops
+# at python3.11, so `runtime: python3.13` raises a config validation *warning*.
+# It is cosmetic -- `serverless package` renders python3.13 into CloudFormation
+# correctly, and CloudFormation accepts it -- but turning validation on would
+# make it a hard error and block every deploy.
+# configValidationMode: error
+
+frameworkVersion: '3'
+useDotenv: true
+
+plugins:
+  - serverless-dotenv-plugin
+
+package:
+  individually: true
+  patterns:
+    # Baseline for every function: ship nothing. Each function then names the
+    # files it actually needs. Without the '!**' line Serverless would zip the
+    # whole folder -- including node_modules, the build/ trees and any dry-run
+    # CSV left in the working copy -- into all eight packages.
+    - '!**'
+
+custom:
+  # Layer ARNs (versioned) printed by `aws lambda publish-layer-version` after
+  # ./build_layers.sh -- see doc/OPERATIONS.md. Set them in .env.
+  #
+  # There is deliberately no default. A wrong or stale layer deploys fine and
+  # then fails on the first import, at 18:30 ET, with nothing written.
+  #
+  #   finDeepCore  pandas, numpy, SQLAlchemy, PyMySQL, python-dotenv, pytz,
+  #                requests          -- every function
+  #   finDeepYf    yfinance + deps   -- the market-data downloaders
+  #   finDeepWeb   lxml, bs4, openpyxl -- the HTML/XLSX scrapers
+  #
+  # finDeepYf and finDeepWeb are de-duplicated against finDeepCore at build
+  # time, so they are only importable with finDeepCore mounted as well.
+  coreLayer: ${env:FINDEEPCORE_LAYER_ARN}
+  yfLayer: ${env:FINDEEPYF_LAYER_ARN}
+  webLayer: ${env:FINDEEPWEB_LAYER_ARN}
+
+provider:
+  name: aws
+  # Declared per function, never here: provider-level python3.13 would be an
+  # invisible way for a future python3.10 function to pick up a 3.13 layer.
+  region: us-east-2
+  profile: ServerLessUser
+  timeout: 900     # default is 6 sec
+  iam:
+    role:
+      statements:
+        # optChainEOD's dispatcher async-invokes itself once per shard.
+        - Effect: Allow
+          Action: 'lambda:InvokeFunction'
+          Resource: "arn:aws:lambda:${aws:region}:${aws:accountId}:function:${self:service}-${sls:stage}-optChainEOD"
+        # statusReport e-mails through the topic declared under resources.
+        - Effect: Allow
+          Action: 'sns:Publish'
+          Resource:
+            Ref: StatusTopic
+
+functions:
+  # ---------------------------------------------------------------------------
+  # New data sets (PLAN-SR-UPSTREAM Phases B-D). These write their own tables
+  # (EOD_WRITE_TBL / OPT_WRITE_TBL, *_shadow until the U6 cutover) and have no
+  # counterpart in fin-cron-data, so nothing else writes what they write and they
+  # are the three safe ones to enable first -- after a manual invoke each.
+  #
+  # Schedules use EventBridge Scheduler (method: scheduler) so they run in
+  # America/New_York and do not drift an hour with DST the way fin-cron-data's
+  # UTC cron entries do.
+  # ---------------------------------------------------------------------------
+  eodDaily:
+      # Daily bars -> EOD_WRITE_TBL, corporate actions -> corp_action_daily,
+      # one load_audit row per symbol.
+    handler: eod_daily_handler.run
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - eod_daily_handler.py
+        - stock_exchange.csv          # DU.load_symbols_dict(): symbol -> exchange
+        - Exchange_timezone.csv       # DU.load_exchange_tz(): exchange -> tz
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    events:
+      # 18:30 ET: >= 60 min after the NYSE close in every season (L2).
+      # EOD_SHARDS=1 -- the full V4 list is ~15 batched downloads.
+      - schedule:
+          enabled: false             # verify by hand, then flip to true
+          method: scheduler
+          rate: cron(30 18 ? * MON-FRI *)
+          timezone: America/New_York
+          input:
+            shard: 0
+            of: 1
+      # Sweep: retries every symbol with no ok/empty load_audit row today.
+      - schedule:
+          enabled: false             # enable together with the 18:30 entry
+          method: scheduler
+          rate: cron(0 19 ? * MON-FRI *)
+          timezone: America/New_York
+          input:
+            sweep: true
+
+  optChainEOD:
+      # Filtered EOD option chains -> OPT_WRITE_TBL; raw chains -> R2
+      # {OPT_RAW_PREFIX}/{date}/. Fans out through a dispatcher.
+    handler: optchain_eod_handler.run
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - optchain_eod_handler.py
+        - eod_daily_handler.py        # imported for exchange_for()
+        - stock_exchange.csv
+        - Exchange_timezone.csv
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    # DISABLED UNTIL THE ACCOUNT CONCURRENCY QUOTA IS RAISED. Reserving
+    # concurrency requires >= 100 unreserved executions to remain, and this
+    # account's *total* ConcurrentExecutions quota is 10 (checked 2026-10-01 with
+    # `aws lambda get-account-settings`), so no value is accepted -- CloudFormation
+    # fails the function with the unhelpful NotUpdatable / "not updatable with
+    # parameters provided" (doc/OPERATIONS.md 8.4).
+    #
+    # Consequence while it is off: nothing caps how many shards hit Yahoo at once,
+    # and the OPT_SHARDS shards draw from the same pool of 10 as the nine live
+    # fin-cron-data functions, so a fan-out can throttle them. optChainEOD's
+    # schedules therefore stay `enabled: false` until the quota is raised to 1000
+    # and this line is restored -- that order, not the reverse (TODOS 2.13).
+    # reservedConcurrency: ${env:OPT_MAX_PARALLEL, 4}
+    events:
+      # 17:40 ET, production's summer time, held fixed across DST. The
+      # dispatcher async-invokes OPT_SHARDS copies of this function.
+      - schedule:
+          enabled: false             # verify by hand, then flip to true
+          method: scheduler
+          rate: cron(40 17 ? * MON-FRI *)
+          timezone: America/New_York
+          input:
+            dispatch: true
+      - schedule:
+          enabled: false             # enable together with the dispatch entry
+          method: scheduler
+          rate: cron(40 18 ? * MON-FRI *)
+          timezone: America/New_York
+          input:
+            sweep: true
+      - schedule:
+          enabled: false             # enable together with the dispatch entry
+          method: scheduler
+          rate: cron(40 19 ? * MON-FRI *)
+          timezone: America/New_York
+          input:
+            sweep: true
+
+  statusReport:
+      # One line per data set from v_load_status -> SNS e-mail + R2 JSON.
+    handler: status_report_handler.run
+    runtime: python3.13
+    timeout: 120
+    package:
+      patterns:
+        - dataUtil.py
+        - status_report_handler.py
+    layers:
+      - ${self:custom.coreLayer}     # no yfinance, no scraping
+    environment:
+      STATUS_TOPIC_ARN:
+        Ref: StatusTopic
+    events:
+      - schedule:
+          enabled: false             # verify by hand, then flip to true
+          method: scheduler
+          rate: cron(0 20 ? * MON-FRI *)
+          timezone: America/New_York
+
+  # ---------------------------------------------------------------------------
+  # python3.13 successors to functions still live in fin-cron-data (Phases E, F).
+  #
+  # These need the extra condition: both the old and the new function append to
+  # the same table, so a schedule here is enabled only as the old function is
+  # retired -- one data set at a time. Until then, invoke-only:
+  #
+  #   serverless invoke -f portAssetsHandlerv2 -d '{"localrun":true,"dbFlag":false,"test":true}'
+  # ---------------------------------------------------------------------------
+  portAssetsHandlerv2:
+      # S&P 500 / NASDAQ-100 / DJIA / HSI membership -> Trading.portfolio_assets_info.
+      # Replaces fin-cron-data's portAssetsHandler, adding DJIA + HSI (Phase E)
+      # and a load_audit summary row (Phase F).
+    handler: port_assets_handler.run
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - port_assets_handler.py
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.webLayer}      # read_html (lxml) + SSGA .xlsx (openpyxl)
+    events:
+      # 18:30 ET Mon-Fri, ~2.5 h after the US close. Index committees announce
+      # membership changes to take effect at an open, so a daily post-close
+      # check catches every change within one business day. Only-on-change
+      # makes a no-change day nearly free: a few fetches, one SELECT, exit.
+      - schedule:
+          enabled: false             # cutover: retire portAssetsHandler first
+          method: scheduler
+          rate: cron(30 18 ? * MON-FRI *)
+          timezone: America/New_York
+
+  usrateHandlerv2:
+      # Fed H.15 scrape -> TBLUSRATES, plus a load_audit summary row.
+    handler: usrate_handler.run
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - usrate_handler.py
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.webLayer}      # BeautifulSoup + read_html
+    events:
+      # 17:05 ET: H.15 is published at ~16:15 ET on business days.
+      - schedule:
+          enabled: false             # cutover: retire usrateHandler first
+          method: scheduler
+          rate: cron(5 17 ? * MON-FRI *)
+          timezone: America/New_York
+
+  FXHistHandlerv2:
+      # Daily FX EOD bars -> TBLHISTFX, plus a load_audit summary row.
+    handler: fxeod_handler.run
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - fxeod_handler.py
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    events:
+      # 17:10 ET, matching the old 21:10 UTC entry in EDT.
+      - schedule:
+          enabled: false             # cutover: retire FXHistHandler first
+          method: scheduler
+          rate: cron(10 17 ? * MON-FRI *)
+          timezone: America/New_York
+
+  yfus30minEODv2:
+      # US 15-minute bars -> TBLMINUTEPRICE, plus a load_audit summary row.
+    handler: intraday_min_handler.run_us
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - intraday_min_handler.py
+        - stock_exchange.csv
+        - Exchange_timezone.csv
+        - intra_blacklist.csv         # read by relative path from the bundle
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    events:
+      # 20:05 ET Mon-Fri -- the same instants as the old cron(05 00 ? * TUE-SAT)
+      # in EDT: 00:05 UTC on Tue-Sat is Mon-Fri evening in New York.
+      - schedule:
+          enabled: false             # cutover: retire yfus30minEOD first
+          method: scheduler
+          rate: cron(5 20 ? * MON-FRI *)
+          timezone: America/New_York
+
+  yfasia30minEODv2:
+      # Asia 15-minute bars -> TBLMINUTEPRICE, plus a load_audit summary row.
+    handler: intraday_min_handler.run_asia
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - intraday_min_handler.py
+        - stock_exchange.csv
+        - Exchange_timezone.csv
+        - intra_blacklist.csv
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    events:
+      # 06:00 ET = 18:00 HKT (19:00 in EST), after the Asian close, matching
+      # the old 10:00 UTC entry in EDT.
+      - schedule:
+          enabled: false             # cutover: retire yfasia30minEOD first
+          method: scheduler
+          rate: cron(0 6 ? * MON-FRI *)
+          timezone: America/New_York
+
+resources:
+  # The e-mail subscription is created only when STATUS_EMAIL is non-empty.
+  #
+  # Learned the hard way on 2026-10-01: with STATUS_EMAIL="" the topic carried a
+  # subscription with an empty Endpoint and SNS rejected the whole topic --
+  # "Invalid parameter: Endpoint" -- which failed the first deploy of the service
+  # outright. The topic is what the functions need (STATUS_TOPIC_ARN); who it
+  # mails is separate, so it must not be able to block a deploy.
+  #
+  # Fn::Equals compares the string exactly, so this is safe in the way an
+  # `enabled: ${env:...}` switch is not (see the warning at the top of this file):
+  # anything other than the empty string -- including whitespace -- creates the
+  # subscription, and a bad address surfaces as an unconfirmed subscription in the
+  # SNS console, never as a silently armed schedule.
+  Conditions:
+    HasStatusEmail:
+      Fn::Not:
+        - Fn::Equals:
+            - ${env:STATUS_EMAIL, ''}
+            - ''
+  Resources:
+    # statusReport's topic. Deploy once early (plan P8) so the owner can confirm
+    # the subscription mail before the first report is sent.
+    StatusTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${sls:stage}-status
+    # Set STATUS_EMAIL in .env and redeploy to create this; AWS then sends a
+    # confirmation mail that has to be clicked once. Clearing STATUS_EMAIL and
+    # redeploying removes the subscription and leaves the topic in place.
+    StatusEmailSubscription:
+      Type: AWS::SNS::Subscription
+      Condition: HasStatusEmail
+      Properties:
+        TopicArn:
+          Ref: StatusTopic
+        Protocol: email
+        Endpoint: ${env:STATUS_EMAIL, ''}

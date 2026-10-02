@@ -6,13 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Fin-Lambda is a collection of scheduled AWS Lambda functions that collect financial market data — stock/ETF snapshots, options chains, intraday bars, FX rates, US interest rates, Fama-French factors, and news — and write them into MySQL (`GlobalMarketData`, `Trading` schemas), PostgreSQL, or S3/Cloudflare R2.
 
-This is **not** a conventional Python package: there is no test suite, no `src/` layout, no `__init__.py`. Each handler is a flat top-level module that Serverless zips together with `dataUtil.py` and the CSVs beside it. Imports are flat (`import dataUtil as DU`) and several CSV reads use relative paths, so **handlers only work when the process CWD is their own directory**.
+This is **not** a conventional Python package: no `src/` layout, no `__init__.py`. Each handler is a flat top-level module that Serverless zips together with `dataUtil.py` and the CSVs beside it. Imports are flat (`import dataUtil as DU`).
+
+There are **two services**. `Ops/fin-cron-data` is the original python3.10 one; its CSV reads use relative paths, so **those handlers only work when the process CWD is their own directory**. `Ops/fin-deep-data` is the python3.13 one, where `dataUtil.list_dir()` resolves the packaged CSVs against the module's own directory, so the CWD only decides where dry-run output lands. The two have separate `serverless.yml`, `.env`, layers, `dataUtil.py` and test roots; a change in one never affects the other.
 
 ## Layout
 
 | Path | Role |
 |---|---|
-| `Ops/fin-cron-data/` | **The live service.** All deployed handlers + `serverless.yml`. MySQL backend. |
+| `Ops/fin-cron-data/` | **The original live service.** Nine python3.10 handlers + `portAssetsHandler` + `serverless.yml`. MySQL backend. **Frozen** — new work goes to `fin-deep-data`. |
+| `Ops/fin-deep-data/` | **The python3.13 service** (added 2026-10-01, PLAN-SR-UPSTREAM A–F). Eight functions, own `serverless.yml`, own `.env`, own `dataUtil.py` fork, own layers, own pytest root. Shares no file with `fin-cron-data`. |
 | `Ops/fin-cron-Pgsql/` | Partial PostgreSQL port (3 scripts only). Its `serverless.yml` is copied from fin-cron-data and references handlers that do not exist in the folder — do not deploy it as-is. |
 | `Dev/fin-cron-data/` | Research: HMM/GMM regime detection, notebooks, its own `dataUtil.py` fork. |
 | `Product_List/` | Symbol CSVs (`Symbol` column) used when a list is loaded from file. |
@@ -40,6 +43,56 @@ This is **not** a conventional Python package: there is no test suite, no `src/`
 
 Despite the `30min` naming, both `eoddata_minhandler_*.py` download `interval='15m'`.
 
+## Deployed functions (`Ops/fin-deep-data/serverless.yml`)
+
+Eight python3.13 functions, added 2026-10-01 (PLAN-SR-UPSTREAM A–F). Schedules
+are **EventBridge Scheduler** entries in `America/New_York`, not UTC cron.
+
+**Every schedule in this service ships `enabled: false`** — a deploy creates the
+functions and runs nothing. Each is verified by manual invoke, then enabled on its
+own (`doc/OPERATIONS.md` §10.4.1). The times below are when a schedule fires
+*once enabled*.
+
+| Function | Handler | Schedule (ET) | Notes |
+|---|---|---|---|
+| eodDaily | `eod_daily_handler.run` | 18:30 Mon-Fri + sweep 19:00 | daily bars → `$EOD_WRITE_TBL`, actions → `corp_action_daily` |
+| optChainEOD | `optchain_eod_handler.run` | dispatch 17:40, sweeps 18:40/19:40 | filtered EOD chains → `$OPT_WRITE_TBL`, raw → R2. Dispatcher fans out `OPT_SHARDS` async shards; `reservedConcurrency` is **commented out** — the account quota forbids it (TODOS 2.13) |
+| statusReport | `status_report_handler.run` | 20:00 Mon-Fri | `v_load_status` → SNS e-mail + R2 JSON |
+| portAssetsHandlerv2 | `port_assets_handler.run` | 18:30 | SP500/NDX100 **+ DJIA + HSI** → `Trading.portfolio_assets_info` |
+| usrateHandlerv2 | `usrate_handler.run` | 17:05 | H.15 scrape → `$TBLUSRATES` |
+| FXHistHandlerv2 | `fxeod_handler.run` | 17:10 | FX daily EOD → `$TBLHISTFX` |
+| yfus30minEODv2 | `intraday_min_handler.run_us` | 20:05 | US 15-min bars → `$TBLMINUTEPRICE` |
+| yfasia30minEODv2 | `intraday_min_handler.run_asia` | 06:00 | Asia 15-min bars, same table |
+
+**The last five carry a second condition.** Each writes a table its still-live
+`fin-cron-data` counterpart writes, so enabling one before the old function is
+retired duplicates rows or stores a spurious membership change. Cut each data set
+over on its own: `doc/OPERATIONS.md` §11.2.
+
+**Deployed 2026-10-01** (`doc/OPERATIONS.md` §10.4): eight functions, eleven
+schedules all `DISABLED`, SNS subscription `PendingConfirmation`. Two things the
+first deploy taught, both now structural: an empty `STATUS_EMAIL` must not reach
+SNS, so the e-mail subscription is a separate resource behind a CloudFormation
+`Condition` rather than a property of the topic (§8.3); and this account's total
+Lambda `ConcurrentExecutions` quota is **10**, so `reservedConcurrency` cannot be
+set anywhere — it needs ≥ 100 unreserved to remain. Raise the quota before
+enabling `optChainEOD` (§8.4, TODOS 2.13).
+
+**Never make `enabled` an `${env:...}` lookup.** Serverless honours only the
+literal `false` / `true`; an empty value, `0`, `yes` or `True` all render
+`State: ENABLED`, and the `must be boolean` warning that would tell you is
+suppressed in this service. Verified 2026-10-01.
+
+Every one of the eight writes a `load_audit` row, and `load_audit.job` is the
+**data set's** job name, not the Lambda's — a v2 function writes
+`usrateHandler`, `yfus30minEOD`, `portAssetsHandler`, … so the status report
+does not grow a second line at the cutover. `load_audit.host` identifies the
+writer.
+
+`intraday_min_handler.py` is one module for both intraday functions: the
+originals differed only in a stored-procedure name and the job name, which now
+live in `MARKETS`.
+
 ## Architecture patterns
 
 These conventions repeat across every handler; follow them rather than introducing new idioms.
@@ -50,7 +103,7 @@ These conventions repeat across every handler; follow them rather than introduci
 
 **Snapshot tables are delete-then-append, not upsert.** `handler.py`, `opt_handler.py`, and `fx_handler.py` all run `DU.ExecSQL(f"DELETE FROM {DB}.{TBL} where (Symbol != '1');")` then `StoreEOD(...)`; the table holds only the newest snapshot. Historical tables (`TBLMINUTEPRICE`, `TBLHISTFX`) instead append after querying `get_Max_datetime()` / `get_Max_date()` for a watermark.
 
-**Symbol lists come from two interchangeable sources.** `DU.load_symbols(name)` reads `$PROD_LIST_DIR/{name}.csv` — *except* when `name == "system"`, which calls the stored procedure `GlobalMarketData.current_symbols_V3`. Other server-side procedures the code depends on: `GlobalMarketData.get_us_symbol`, `GlobalMarketData.get_asia_symbol`, `Trading.sp_etf_trades_v2`, `Trading.sp_stock_trades_V3`. None are in the repo, so a schema change there breaks handlers silently.
+**Symbol lists come from two interchangeable sources.** `DU.load_symbols(name)` reads `$PROD_LIST_DIR/{name}.csv` — *except* when `name == "system"`, which calls the stored procedure `GlobalMarketData.current_symbols_V3`. The `fin-deep-data` collectors instead call `DU.load_symbols_db(SYMBOL_PROC_VER, sym_type)` → `GlobalMarketData.current_symbols_{ver}` (V4: 863 rows on 2026-10-01; it already includes the stock- and ETF-options lists and the `portfolio_assets_info` members, so they add no union of their own). **V5 adds an `@type` argument** — `'a'` (eodDaily) returns that union minus delisted symbols, `'o'` (optChainEOD) also drops `SymbolMaster.options = 0`; 838 / 814 rows. V1–V4 take no argument, so `load_symbols_db` withholds the type for those and `SYMBOL_PROC_VER` can be flipped either way without a code change. DDL: `Ops/fin-deep-data/sql/current_symbols_V5.sql` (the owner runs it). MySQL has no default argument values, so "default `'a'`" lives in the caller and in the procedure body, not in the signature. Other server-side procedures the code depends on: `GlobalMarketData.get_us_symbol`, `GlobalMarketData.get_asia_symbol`, `Trading.sp_etf_trades_v2`, `Trading.sp_stock_trades_V3`. None are in the repo, so a schema change there breaks handlers silently.
 
 **Timezones are per-exchange, not per-handler.** The intraday handlers map symbol → exchange via `stock_exchange.csv` (`DU.load_symbols_dict()`) and exchange → tz via `Exchange_timezone.csv` (`DU.load_exchange_tz()`), then store `Datetime` tz-naive in exchange-local time alongside a `UTCDatetime` copy and a `timezone` column. `intra_blacklist.csv` subtracts known-bad symbols; a symbol missing from `stock_exchange.csv` is skipped entirely.
 
@@ -60,17 +113,38 @@ These conventions repeat across every handler; follow them rather than introduci
 
 There **is** a test suite now (added 2026-08-01, `TODOS.md` §0):
 
+**Two pytest roots, one per service.** Both folders contain modules named
+`dataUtil` and `port_assets_handler`, so only one can be on `sys.path` in a
+session. Never merge them.
+
 ```bash
-pytest tests/unit -v          # hermetic; an autouse fixture fails any test that opens a socket
-pytest -m integration         # opt-in, hits live sources
+# fin-cron-data (python3.10)
+venv-cron7/bin/python -m pytest tests/unit -v
+
+# fin-deep-data (python3.13) -- run from its own folder
+cd Ops/fin-deep-data && ../../venv-py313/bin/python -m pytest tests/unit -v
+
+pytest -m integration         # opt-in, hits live sources, either root
 ```
 
-Run it from a venv carrying the **pinned layer versions** (`venv-cron7` here),
-not whatever is newest. `pytest.ini` sets `pythonpath = Ops/fin-cron-data`
-because handlers use flat imports.
+An autouse fixture fails any test that opens a socket. Run each root from a venv
+carrying **that service's pinned layer versions** (`venv-cron7`: pandas 1.5.3 /
+SQLAlchemy 1.4.46; `venv-py313`: pandas 2.2.3 / SQLAlchemy 2.0.36 / numpy 2.1.3 /
+yfinance 0.2.58), not whatever is newest. Each `pytest.ini` sets `pythonpath` to
+its own service folder, because handlers use flat imports.
 
-Coverage so far is `dataUtil.ExecSQL` and `port_assets_handler` only; the other
-nine handlers remain uncovered (`TODOS.md` §2).
+Coverage: `fin-deep-data` is covered end to end (320 tests — every handler, every
+Phase A helper). In `fin-cron-data` only `dataUtil.ExecSQL` and
+`port_assets_handler` are covered; the other nine handlers remain uncovered
+(`TODOS.md` §2).
+
+**Python 3.13 policy.** All new code targets python3.13 and lives in
+`Ops/fin-deep-data`. A module is not done until, in `venv-py313`: `py_compile`
+and a clean `import` from the service folder pass, its pytest file passes, the
+suite raises no `FutureWarning`/`DeprecationWarning` **from our own modules**
+(`-W error::FutureWarning:<module>` etc. — `pytest.ini` ignores
+`DeprecationWarning` wholesale, so the gate has to be explicit), and its
+`__main__` dry run completes with writes off.
 
 ## Local runs
 
@@ -92,6 +166,30 @@ The off-switch is **not uniform** — check the handler before running one again
 
 Outputs land in the CWD as `snapshot_yf.csv`, `options_list.csv`, `options_snapshot.csv`, `30min_{sym}.csv`, `USD_FX.csv`. `DEBUG=debug` in `.env` raises log level everywhere.
 
+In `Ops/fin-deep-data` the off-switch **is** uniform — `dbFlag=False` on every
+handler, with `localrun` only choosing where files go **locally**. On Lambda the
+output directory is always under `/tmp` whatever `localrun` says, because
+`/var/task` is read-only; every handler goes through `dataUtil.out_dir()` and
+none of them computes this itself (`doc/OPERATIONS.md` §8.6):
+
+```bash
+cd Ops/fin-deep-data
+../../venv-py313/bin/python eod_daily_handler.py        # {"localrun": True, "dbFlag": False, "test": 25}
+#   ^ this __main__ passed dbFlag: True until 2026-10-01 -- read a __main__ before running it
+../../venv-py313/bin/python optchain_eod_handler.py     # full-V4 timing run -> OPT_SHARDS
+../../venv-py313/bin/python status_report_handler.py
+../../venv-py313/bin/python port_assets_handler.py
+../../venv-py313/bin/python usrate_handler.py
+../../venv-py313/bin/python fxeod_handler.py
+../../venv-py313/bin/python intraday_min_handler.py [asia]
+```
+
+Every `__main__` there supplies a dry-run event. **`localrun` alone is not an
+off-switch**: on 2026-10-01 a `port_assets_handler` "dry run" whose `__main__`
+passed `dbFlag: True` wrote four membership sets to production
+(`doc/OPERATIONS.md` §8). Outputs are gitignored; expected shapes are in
+`doc/OPERATIONS.md` §10.6.
+
 ## Build & deploy
 
 ```bash
@@ -103,12 +201,32 @@ cd Ops/fin-cron-data && serverless deploy      # deploy all functions
 serverless deploy function -f optHandler       # single function, much faster
 ```
 
-**Two runtimes, two layers.** `finPort313` pins `pandas==2.2.3`,
-`SQLAlchemy==2.0.36`, `numpy==2.1.3` for `portAssetsHandler`; `finCron` keeps
-the 3.10 pins below for the other nine. The runtime and layer ARN are declared
-**on the function**, never at provider level, so the two can never cross.
-`dataUtil.py` is shared and runs unmodified on both — `ExecSQL` uses
-`Engine.begin()` + `text()` rather than the `Engine.execute()` that 2.0 removed.
+```bash
+# fin-deep-data layers (python3.13). Core first -- yf and web are
+# de-duplicated against it and are unusable without it.
+make finDeep                                   # finDeepCore/Yf/Web.zip
+# then ALWAYS import-test the build trees before publishing: doc/OPERATIONS.md 10.3.2
+cd Ops/fin-deep-data && serverless deploy       # all eight functions
+```
+
+**A layer is not verified by a `CodeSha256` match.** On 2026-10-01 a `strip
+--strip-unneeded` pass in `build_layers.sh` corrupted numpy's bundled OpenBLAS;
+the zip uploaded intact and hashed correctly, and every function failed at import
+(`doc/OPERATIONS.md` §8.5). Never strip `.so` files in these layers, and run the
+§10.3.2 import test — in the layer *combinations* each function mounts — after
+every build. The published layers are at **v2**; v1 of `finDeepCore` and
+`finDeepYf` is broken.
+
+**Two runtimes, five layers.** `finCron` keeps the 3.10 pins below for the nine
+old functions; `finPort313` serves `portAssetsHandler`; `finDeepCore` (101 MB
+unzipped / 29 MB zipped) + `finDeepYf` (28/10) + `finDeepWeb` (14/6) serve the
+eight `fin-deep-data` functions. The runtime and the layer ARNs are declared **on
+the function**, never at provider level, so no layer can reach the wrong runtime.
+The three-way split exists to keep every layer zip well under the ~80 MB working
+ceiling and to let a function mount only what it imports;
+`Ops/fin-deep-data/build_layers.sh` enforces the ceiling and does the
+de-duplication. `dataUtil.py` is **forked**, not shared: the `fin-deep-data` copy
+is 3.13/SQLAlchemy-2.0-only and changes there do not propagate.
 
 Serverless Framework 3.38 does not recognise `python3.13` and emits a config
 validation *warning*; it renders correctly into CloudFormation, but
@@ -120,13 +238,15 @@ Other layers (`finWebLib`, `finSvrLib`, `finVisLib`, `finDataLib`) build from th
 
 ## Configuration
 
-Each Ops subfolder has its own `.env`, loaded by a module-level `load_dotenv()`. **`.env.example` at the repo root is the committed template** (added 2026-08-01, closing `TODOS.md` §3.6). If you add or rename an env var, update `.env.example` in the same change, and record it in `doc/OPERATIONS.md`.
+Each Ops subfolder has its own `.env`, loaded by a module-level `load_dotenv()`, and its own committed template **beside it**: `Ops/fin-cron-data/.env.example` and `Ops/fin-deep-data/.env.example`. (This file previously said the template was at the repo root; there is no `.env.example` there — plan finding F2.) If you add or rename an env var, update that service's `.env.example` in the same change, and record it in `doc/OPERATIONS.md`.
 
 Groups: DB (`DBHOST`, `DBPORT`, `DBUSER`, `DBPWD`, `DBMKTDATA`, `DBTRADING`, `DBPREDICT`, `DBWEB`) · tables (`TBLDLYPRICE`, `TBLMINUTEPRICE`, `TBLSNAPSHOOT`, `TBLFXSNAPSHOT`, `TBLHISTFX`, `TBLUSRATES`, `TBLOPTCHAIN`, `TBLPORTASSETS`, `TBLWEBPREDICT`, …) · lists (`PROD_LIST_DIR`, `SYMBOLLIST`, `DEFAULT_TICKERS`, `FX_TICKERS` — a Python list literal parsed with `ast.literal_eval`) · feeds (`defaultIP`, `defaultPort`, `VENDOR`, `OptDataEngine`, `API_KEY`, `POLYGON_API_KEY`) · storage (`S3_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`) · index membership (`SP500_PORT_NAME`, `NDX100_PORT_NAME`, `PORT_ASSET_CLASS`, `PORT_ASSET_TYPE`, `INDEX_CROSSCHECK`, `PORT_OUTPUT_DIR`) · misc (`DEBUG`, `LOCALRUN`, `BATCH_SIZE`, `FIRSTTRAINDTE`, `LASTTRAINDATE`).
 
 `TBLDLYPRICE` is **`histdailyprice7`** — this file previously said `histdailyprice3`, which does not exist on the server.
 
 The MySQL server runs with **`sql_require_primary_key=ON`**, so `StoreEOD`'s `to_sql(if_exists='append')` can never auto-create a table: any new target table must be created manually with a primary key first.
+
+`Ops/fin-deep-data/.env` adds, on top of the groups above: write targets (`EOD_WRITE_TBL`, `OPT_WRITE_TBL`, `TBLLOADAUDIT`, `TBLCORPACTION` — all **required, no fallback**, so `dataUtil.require_env` raises at startup rather than letting the string `None` reach SQL) · list and sharding (`SYMBOL_PROC_VER`, `EOD_SHARDS`, `EOD_BATCH`, `OPT_SHARDS`, `OPT_MAX_PARALLEL`) · upstream storage (`UPSTREAM_R2_BUCKET`, `OPT_RAW_PREFIX`, `STATUS_R2_KEY`) · status (`STATUS_EMAIL`; `STATUS_TOPIC_ARN` is injected by CloudFormation, never put it in `.env`) · index membership (`DJIA_PORT_NAME`, `HSI_PORT_NAME`) · layers (`FINDEEPCORE_LAYER_ARN`, `FINDEEPYF_LAYER_ARN`, `FINDEEPWEB_LAYER_ARN`). There, `PROD_LIST_DIR` is left **empty** on purpose: `dataUtil.list_dir()` then uses the packaged folder, which is correct both on Lambda and locally.
 
 `Ops/fin-cron-Pgsql/dataUtil_Pgsql.py` hardcodes an absolute macOS dotenv path (`/Users/huangjunyi/...`) that does not exist in this WSL environment, and reads a different key set (`RHOST`, `DB`, `PORT`) — that folder cannot run locally without fixing this first.
 
@@ -175,17 +295,17 @@ Each doc already has (or must have) a `## Changelog` section as its first sectio
 
 ### 3. All Change Plans Must Include a Test Section
 
-This repo has **no automated test suite yet** — no `pytest`, no `conftest.py`, no CI. That is being fixed incrementally:
+There is a `pytest` suite now — two of them, one per service (see *Tests*) — but no CI. Coverage is complete in `Ops/fin-deep-data` and partial in `Ops/fin-cron-data`.
 
-> **Every new Lambda function ships with a test file. Every change to an existing function adds or updates a test for the path it touches.** The retroactive backlog for the handlers that predate this rule is tracked in [`TODOS.md`](TODOS.md) — check it before writing tests so you build on the shared fixtures in section 0 rather than a parallel harness.
+> **Every new Lambda function ships with a test file. Every change to an existing function adds or updates a test for the path it touches.** The retroactive backlog for the handlers that predate this rule is tracked in [`TODOS.md`](TODOS.md) — check it before writing tests so you build on the shared fixtures in section 0 rather than a parallel harness. A test for a `fin-deep-data` module goes in `Ops/fin-deep-data/tests/unit/`, never in the repo-root tree: the two roots cannot be mixed.
 
-Until the harness in `TODOS.md` §0 exists, "testing" also means an explicit, reproducible verification run against real data with writes disabled. A change plan must address all four points below; substitute verification steps for test cases only where no test file exists yet.
+"Testing" also means an explicit, reproducible verification run against real data with writes disabled. A change plan must address all four points below; substitute verification steps for test cases only where no test file exists yet.
 
 1. **Must pass all existing verification** — Every check that applied before the change must still pass. Concretely:
-   - Every handler touched by the change still runs to completion as a local dry run (see *Local runs*) with writes suppressed — `{"dbFlag": False}` for the intraday handlers, `{"localrun": True}` or `LOCALRUN=localrun` for the rest. Non-zero exit or a new stack trace in the log is a failure.
+   - Every handler touched by the change still runs to completion as a local dry run (see *Local runs*) with writes suppressed — `{"dbFlag": False}` for every `fin-deep-data` handler and for the intraday ones, `{"localrun": True}` or `LOCALRUN=localrun` for the rest. Non-zero exit or a new stack trace in the log is a failure. **Read the handler's `__main__` before running it**: `localrun` alone does not suppress writes, and a `__main__` that passes `dbFlag: True` writes to production (`doc/OPERATIONS.md` §8, 2026-10-01).
    - Output CSVs are compared against the previous run: row count, column set, and dtypes must match, and spot-checked values must be sane (no all-`NaN` columns, no zero-row output for a live market window). The CSVs checked into `Ops/fin-cron-data/` (`snapshot_yf.csv`, `options_list.csv`, `options_snapshot.csv`) are the de facto golden references — state which one you diffed against.
-   - `serverless print` (and `serverless package` for deploy-affecting changes) succeeds from `Ops/fin-cron-data/`, validating `serverless.yml` without deploying.
-   - Any module you edited still imports cleanly under Python 3.10 with the **pinned layer versions** (`pandas==1.5.3`, `SQLAlchemy==1.4.46`, `numpy==1.26.4`, `yfinance==0.2.58`) — not whatever is newest in your local venv. A change that only works on SQLAlchemy 2.x or pandas 2.x is a regression.
+   - `serverless print` (and `serverless package` for deploy-affecting changes) succeeds from the service folder you touched — `Ops/fin-cron-data/` or `Ops/fin-deep-data/` — validating `serverless.yml` without deploying.
+   - Any module you edited still imports cleanly under **its own service's pinned layer versions** — `venv-cron7` (Python 3.10, `pandas==1.5.3`, `SQLAlchemy==1.4.46`, `numpy==1.26.4`, `yfinance==0.2.58`) for `fin-cron-data`, `venv-py313` (Python 3.13, `pandas==2.2.3`, `SQLAlchemy==2.0.36`, `numpy==2.1.3`, `yfinance==0.2.58`) for `fin-deep-data` — not whatever is newest in your local venv. In `fin-cron-data`, code that only works on SQLAlchemy 2.x or pandas 2.x is a regression; in `fin-deep-data`, 3.13 is the only target and the warning gate in *Tests* also applies.
 2. **Announce removal of obsolete verification** — If the change retires a handler, an event flag, a CSV output, a symbol list, or a stored-procedure dependency, say so explicitly and state why the corresponding dry run or golden CSV no longer applies. Deleting a stale golden CSV counts and must be announced.
 3. **Announce addition of new tests** — A new Lambda function requires a `pytest` file; this is not optional. For changes to existing functions, add a unit test covering the path you touched wherever the logic is pure and importable (date/timezone math, symbol filtering, field mapping, DataFrame reshaping), and fall back to a documented dry run — with the exact event dict and expected output shape — only for code that cannot be isolated from the network or the DB. New env vars need a check that the handler behaves correctly when the var is **absent**, since `environ.get()` returns `None` silently and the failure surfaces later as a bad SQL string.
 4. **Document added/removed verification** — Record every added or removed check in `HISTORY.md` under *Test coverage*, and in the matching `doc/*.md` file (dry-run procedures and incident checks in `doc/OPERATIONS.md`; event contracts and table columns in `doc/API-REFERENCE.md`). Update this `CLAUDE.md` if the way a handler is verified changes.

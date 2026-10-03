@@ -211,7 +211,9 @@ Changes from the old job:
 
 - Reads `v_load_status`. For data sets whose handler does not write audit rows yet, it takes `MAX(Date)` from a module-level table list and marks it `(inferred)`.
 - `status_for(row, today)` gives ok / partial / error / stale (stale = last data older than the previous weekday). `aggregate_shards()` combines shard rows. `format_report()` produces SR tech doc §4.5.7's format — reproduced in D.1, with the cases in D.2.
-- Outputs: SNS e-mail, R2 `STATUS_R2_KEY` as JSON, and stdout on a local run.
+- Outputs: SNS e-mail and stdout. ~~R2 `STATUS_R2_KEY` as JSON~~ — the R2 upload,
+  `to_json()` and `STATUS_R2_KEY` were **removed 2026-10-02**: the report is a
+  formatted view of `load_audit`, which already keeps every figure it shows.
 - The SNS topic, e-mail subscription and `sns:Publish` statement already exist from P8/P9. The ARN reaches the function through `environment: STATUS_TOPIC_ARN: !Ref`.
 - Runtime `python3.13` + `finPort313`.
 - Schedule: Mon–Fri 20:00 America/New_York.

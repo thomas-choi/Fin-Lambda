@@ -11,6 +11,7 @@ parses. Those *are* its API.
 
 ## Changelog
 
+- 2026-10-02 | Deleted | §7.7 the `{STATUS_R2_KEY}` row — statusReport no longer writes R2; §7 its return value drops the `r2` key and `localrun` no longer mentions R2.
 - 2026-10-01 | Modified | §4 `load_symbols_db` takes `sym_type` (V5's `@type`) and §7 adds `symbol_proc_type`; §7 the `eodDaily` and `optChainEOD` event contracts gain `symType` and name the procedure their `symbols` default comes from.
 - 2026-10-01 | Added | §7 the `current_symbols_V5` call contract — argument values, which handler sends which, and the result column the caller reads.
 - 2026-10-01 | Added | §4 `dataUtil.out_dir()` / `on_lambda()` in the function reference. `localrun` no longer changes the output directory on Lambda — it is always under `/tmp`.
@@ -323,13 +324,15 @@ returns `{mode: "dispatch", asof, shards, started, events}`.
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `localrun` | bool | `False` | print only — no SNS, no R2 |
+| `localrun` | bool | `False` | print only — no SNS |
 | `dbFlag` | bool | `True` | `False` behaves like `localrun` |
 | `asof` | `YYYY-MM-DD` | today in NY | report date, used for the staleness test |
 | `test` | bool | `False` | DEBUG logging |
 | `NYTIME` | datetime | now in NY | injected clock |
 
-Returns `{asof, subject, lines, statuses, error, sns, r2}`.
+Returns `{asof, subject, lines, statuses, error, sns}`. The `r2` key was
+removed on 2026-10-02 with the R2 upload itself — a consumer that read it
+should query `GlobalMarketData.v_load_status` instead (§6).
 
 **`portAssetsHandlerv2` — `port_assets_handler.run`** — same contract as
 `portAssetsHandler` in §1 (`localrun`, `dbFlag`, `force`, `test`, `NYTIME`) and
@@ -491,9 +494,13 @@ optChainEOD writes the 20 `N_COLUMNS` of the ported job, in that order.
 | Key | Written by | Content |
 |---|---|---|
 | `{OPT_RAW_PREFIX}/{YYYY-MM-DD}/{sym}-PM.csv` | optChainEOD | the **unfiltered** chain for one underlying, as downloaded, CSV |
-| `{STATUS_R2_KEY}` (default `status/latest.json`) | statusReport | `{asof, generated_at, rows: [...]}`, overwritten each run |
 
 Bucket `UPSTREAM_R2_BUCKET`, credentials `R2_ENDPOINT` / `R2_ACCESS_KEY_ID` /
 `R2_SECRET_ACCESS_KEY` (the `yf-news-collect` credentials reused). With the
 bucket unset, optChainEOD logs a warning and still writes its tables — the raw
 archive is best-effort, the database write is not.
+
+`optChainEOD` is the only `fin-deep-data` writer of R2. **Removed 2026-10-02:**
+`statusReport`'s `{STATUS_R2_KEY}` JSON (`{asof, generated_at, rows: [...]}`,
+default `status/latest.json`) and the `STATUS_R2_KEY` env var. `load_audit` /
+`v_load_status` is the durable copy of that payload.

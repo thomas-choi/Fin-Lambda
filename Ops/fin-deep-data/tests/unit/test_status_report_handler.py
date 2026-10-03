@@ -1,7 +1,7 @@
 """Unit tests for ``status_report_handler`` (statusReport, PLAN-SR-UPSTREAM Phase D).
 
 python3.13 only (``venv-py313``). The view / audit reads go through a sqlite
-mirror of ``load_audit`` or a patched ``load_df_SQL``; SNS and R2 are stubbed.
+mirror of ``load_audit`` or a patched ``load_df_SQL``; SNS is stubbed.
 """
 
 from datetime import date, datetime
@@ -162,14 +162,6 @@ def test_format_report_lists_errors_and_subject():
     assert H.subject_for([], date(2026, 9, 25)).endswith("all ok")
 
 
-def test_to_json_is_serialisable():
-    import json
-    payload = json.loads(H.to_json([_line(table_name="t", job="j", status="ok",
-                                          started_at=pd.Timestamp("2026-09-25 22:00"))],
-                                   date(2026, 9, 25), datetime(2026, 9, 26, 0, 0)))
-    assert payload["asof"] == "2026-09-25" and payload["rows"][0]["last_data_date"] == "2026-09-25"
-
-
 # --------------------------------------------------------------------------
 # S4 run() against a sqlite mirror
 # --------------------------------------------------------------------------
@@ -242,7 +234,7 @@ def test_run_combines_shards_and_sweep(status_db, capsys, monkeypatch):
     assert any(l.startswith("histdailyprice7 ") and "2026-09-24" in l for l in inferred)
     assert any(l.startswith("histminprice") and "2026-09-24" in l for l in inferred)
     assert not any(l.startswith("USRates") for l in inferred)   # audited now, not inferred
-    assert out["sns"] is False and out["r2"] is None
+    assert out["sns"] is False and "r2" not in out
 
 
 def test_run_partial_after_sweep(status_db, capsys):
@@ -253,23 +245,29 @@ def test_run_partial_after_sweep(status_db, capsys):
     assert "partial" in line and "1/2" in line
 
 
-def test_run_sends_sns_and_r2(status_db, monkeypatch):
+def test_run_sends_sns(status_db, monkeypatch):
     sent = {}
     monkeypatch.setenv("STATUS_TOPIC_ARN", "arn:aws:sns:us-east-2:1:finStatus")
     monkeypatch.setattr(H, "publish_sns", lambda arn, subj, body: sent.update(arn=arn, subj=subj, body=body))
-    monkeypatch.setattr(H, "put_r2_json", lambda payload: sent.update(payload=payload) or "b/status/latest.json")
     out = H.run({"asof": "2026-09-25"}, None)
-    assert out["sns"] is True and out["r2"] == "b/status/latest.json"
+    assert out["sns"] is True and "r2" not in out
     assert sent["arn"].endswith("finStatus") and sent["subj"].startswith("Fin-Lambda status 2026-09-25")
-    assert '"asof": "2026-09-25"' in sent["payload"]
+    assert sent["body"].startswith("Fin-Lambda load status for 2026-09-25 (ET)")
+
+
+def test_run_has_no_r2_upload_path(status_db, monkeypatch):
+    """U9 report delivers e-mail only: load_audit is the durable copy."""
+    monkeypatch.setenv("STATUS_TOPIC_ARN", "arn:aws:sns:us-east-2:1:finStatus")
+    monkeypatch.setattr(H, "publish_sns", lambda *a: None)
+    assert not hasattr(H, "put_r2_json") and not hasattr(H, "to_json")
+    assert "r2" not in H.run({"asof": "2026-09-25"}, None)
 
 
 def test_run_delivery_failures_are_logged_not_raised(status_db, monkeypatch):
     monkeypatch.setenv("STATUS_TOPIC_ARN", "arn")
     monkeypatch.setattr(H, "publish_sns", lambda *a: (_ for _ in ()).throw(OSError("sns down")))
-    monkeypatch.setattr(H, "put_r2_json", lambda *a: (_ for _ in ()).throw(OSError("r2 down")))
     out = H.run({"asof": "2026-09-25"}, None)
-    assert out["sns"] is False and out["r2"] is None
+    assert out["sns"] is False
 
 
 def test_run_unreadable_view_still_reports_inferred(env, monkeypatch, capsys):

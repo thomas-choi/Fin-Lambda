@@ -10,6 +10,7 @@ and the tables they write.
 
 ## Changelog
 
+- 2026-10-02 | Modified | §statusReport outputs and the data-flow diagram: the R2 JSON archive is removed — SNS e-mail + stdout only, with `load_audit` / `v_load_status` as the durable copy.
 - 2026-10-01 | Modified | §6.2 `option_chains()` retries twice, not five times — the sweep invocations are the real retry.
 - 2026-10-01 | Added | §5 `current_symbols_V5` and its `@type` argument ('a' all-but-delisted, 'o' also drops `options = 0`); §6.2 the data flow now shows which type each collector asks for; §6 `dataUtil.load_symbols_db` gains `sym_type` and `symbol_proc_type`.
 - 2026-10-01 | Modified | §5 `current_symbols_V4` row: measured 863 rows, and it is the unfiltered union — the exclusion list is V5's.
@@ -317,7 +318,7 @@ declared on each function, never at provider level.
 |---|---|---|---|---|
 | eodDaily | `eod_daily_handler.run` | core + yf | 18:30 Mon–Fri; sweep 19:00 | `$EOD_WRITE_TBL` (INSERT IGNORE), `corp_action_daily`, `load_audit` |
 | optChainEOD | `optchain_eod_handler.run` | core + yf | dispatch 17:40; sweeps 18:40, 19:40 | `$OPT_WRITE_TBL` (INSERT IGNORE), R2 `$OPT_RAW_PREFIX/`, `load_audit` |
-| statusReport | `status_report_handler.run` | core | 20:00 Mon–Fri | nothing — SNS e-mail + R2 JSON |
+| statusReport | `status_report_handler.run` | core | 20:00 Mon–Fri | nothing — SNS e-mail only |
 | portAssetsHandlerv2 | `port_assets_handler.run` | core + web | 18:30 — **disabled** | `Trading.portfolio_assets_info` (only-on-change), `load_audit` |
 | usrateHandlerv2 | `usrate_handler.run` | core + web | 17:05 — **disabled** | `$TBLUSRATES`, `load_audit` |
 | FXHistHandlerv2 | `fxeod_handler.run` | core + yf | 17:10 — **disabled** | `$TBLHISTFX`, `load_audit` |
@@ -367,7 +368,7 @@ wrote the row.
                              v
                     load_audit -> v_load_status
                              v
-                       statusReport -> SNS e-mail + R2 status/latest.json
+                       statusReport -> SNS e-mail (+ stdout)
 ```
 
 Both collectors are idempotent: writes are `INSERT IGNORE`, so a re-run, an
@@ -464,7 +465,10 @@ sighting and its `first_seen_at` win.
 
 **`GlobalMarketData.v_load_status`** — the latest summary row per
 `(table_name, job)`, via `ROW_NUMBER()`. Read by `statusReport` and by
-Support-Resistance-Agent's `sr status`.
+Support-Resistance-Agent's `sr status`. `load_audit` itself is the durable copy
+of every status line, so `statusReport` keeps no archive of its own: it reads,
+formats and e-mails, and a consumer that wants history queries the view
+(2026-10-02).
 
 **`histdailyprice7_shadow` / `OptionChains_shadow`** — `CREATE TABLE … LIKE` of
 the production tables, the write targets during the shadow run. The cutover is

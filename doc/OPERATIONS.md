@@ -8,6 +8,7 @@ Running, deploying and debugging Fin-Lambda.
 
 ## Changelog
 
+- 2026-10-02 | Deleted | `STATUS_R2_KEY` from the §2 env table and statusReport from the R2 var rows — its R2 JSON upload is removed; §9 troubleshooting row for `r2: null` marked impossible; §10.4 unset-bucket note now concerns optChainEOD only.
 - 2026-10-01 | Added | §10.6 the `max_retries` 5 → 2 measurement: an errored underlying costs ~6 s instead of ~24 s, why `OPT_SHARDS` stays 4 for now, and the empty-chain mode the sweeps do not retry.
 - 2026-10-01 | Added | §8.7 — a `current_symbols_V4` carrying `option` instead of `options` returned an empty symbol list instead of an error; §11.1 step 1 now covers `sql/current_symbols_V5.sql` and the `SYMBOL_PROC_VER=V5` flip.
 - 2026-10-01 | Modified | §10.2 `SYMBOL_PROC_VER` row records V5's `@type` and which handler sends which value; §10.1 the python3.13 suite is 320 tests, not 278.
@@ -700,7 +701,7 @@ this incident, so recreating V5 from the file cannot reintroduce the typo.
 | `CREATE_FAILED: StatusTopic ... "Invalid parameter: Endpoint"` | `STATUS_EMAIL` is empty. Fixed structurally in §8.3; if it recurs, the subscription is back inside the topic's properties |
 | `AWS::Lambda::Function ... "is not updatable with parameters provided"` (`NotUpdatable`) | Almost certainly `reservedConcurrency` against an account quota below 100. Check `aws lambda get-account-settings`; see §8.4 |
 | Deploy fails and every other function says `Resource creation cancelled` | Only the *first* `CREATE_FAILED` matters — the rest are collateral. `aws cloudformation describe-stack-events ... --query 'StackEvents[?ResourceStatus==\`CREATE_FAILED\`]'` |
-| `statusReport` returns `r2: null` with a logged upload error | `UPSTREAM_R2_BUCKET` is unset. The e-mail still went out; the JSON did not (§10.4) |
+| `statusReport` returns `r2: null` with a logged upload error | **Cannot occur after 2026-10-02** — the R2 upload and the `r2` return key are gone. If you see it, a pre-2026-10-02 package is still deployed: redeploy the function (§10.4) |
 
 ---
 
@@ -788,9 +789,9 @@ addition.
 | `SYMBOLLIST` | intraday v2 | one list name, or unset to loop over four |
 | `PROD_LIST_DIR` | `dataUtil.list_dir()` | **leave empty** — then the packaged folder is used, which is right on Lambda and locally |
 | `TBLDLYPRICE` `TBLOPTCHAIN` `TBLUSRATES` `TBLHISTFX` `TBLMINUTEPRICE` `TBLPORTASSETS` | statusReport (inferred lines) and the v2 handlers | `histdailyprice7`, `OptionChains`, `USRates`, `FX_histdaily`, `histminprice`, `portfolio_assets_info` |
-| `R2_ENDPOINT` `R2_ACCESS_KEY_ID` `R2_SECRET_ACCESS_KEY` | optChainEOD, statusReport | reused from `yf-news-collect` |
-| `UPSTREAM_R2_BUCKET` | optChainEOD, statusReport | unset → raw chains are **not** archived (logged as a warning, the run still succeeds) |
-| `OPT_RAW_PREFIX` `STATUS_R2_KEY` | optChainEOD, statusReport | `raw/optchain`, `status/latest.json` |
+| `R2_ENDPOINT` `R2_ACCESS_KEY_ID` `R2_SECRET_ACCESS_KEY` | optChainEOD | reused from `yf-news-collect`. **statusReport no longer reads any R2 var** (2026-10-02) |
+| `UPSTREAM_R2_BUCKET` | optChainEOD | unset → raw chains are **not** archived (logged as a warning, the run still succeeds) |
+| `OPT_RAW_PREFIX` | optChainEOD | `raw/optchain`. `STATUS_R2_KEY` was removed on 2026-10-02 with statusReport's R2 upload — delete it from `.env` if an old copy still carries it |
 | `STATUS_EMAIL` | `serverless.yml` resources | **must be set before the first deploy** — an empty `Endpoint` makes the SNS subscription fail in CloudFormation |
 | `STATUS_TOPIC_ARN` | statusReport | injected by CloudFormation (`Ref: StatusTopic`); do **not** put it in `.env` |
 | `SP500_PORT_NAME` `NDX100_PORT_NAME` `DJIA_PORT_NAME` `HSI_PORT_NAME` | portAssetsHandlerv2 | `SP500`, `NDX100`, `DJI`, `HSI` |
@@ -1037,11 +1038,12 @@ scrapers); 11 schedules, all `DISABLED`, all `America/New_York`; one e-mail
 subscription in `PendingConfirmation`. Zip sizes 11–72 KB.
 
 Still unset after that deploy, and deliberately not blocking it:
-`UPSTREAM_R2_BUCKET`. `statusReport` wraps its R2 upload in `try/except`, so the
-e-mail still goes out and the run returns `r2: None` with one logged error;
-`optChainEOD` uses `env_or` and only warns, so **the raw chain archive is
-silently not written**. Set the bucket before trusting either as a source of
-record.
+`UPSTREAM_R2_BUCKET`. `optChainEOD` uses `env_or` and only warns, so **the raw
+chain archive is silently not written**; set the bucket before trusting it as a
+source of record. `statusReport` is unaffected — on 2026-10-02 its R2 upload was
+removed, because the report is a formatted view of `load_audit` and that table
+is the durable copy. Its only delivery is the SNS e-mail, and its return value
+no longer carries an `r2` key.
 
 ### 10.4.1 Bringing one function online
 

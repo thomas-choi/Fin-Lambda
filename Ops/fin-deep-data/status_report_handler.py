@@ -14,8 +14,9 @@ previous weekday; for the on-change sets in ``EVENT_TABLES``, last *run*), ``par
 ``ok``. Holidays are not modelled: the SR watchdog applies the exchange
 calendar, so this report can say ``stale`` the day after a US holiday.
 
-Outputs: SNS e-mail (``STATUS_TOPIC_ARN``), R2 JSON (``STATUS_R2_KEY`` in
-``UPSTREAM_R2_BUCKET``) and stdout. ``dbFlag=False`` / ``localrun`` prints only.
+Outputs: SNS e-mail (``STATUS_TOPIC_ARN``) and stdout. ``dbFlag=False`` /
+``localrun`` prints only. The report is a view of ``load_audit``, which is the
+durable copy -- nothing is archived to R2.
 
 Runs on **python3.13** with the ``finDeepCore`` layer -- no yfinance, no
 scraping. Its deploy package carries this module and ``dataUtil.py`` only.
@@ -26,7 +27,6 @@ Local run (reads MySQL, prints the report, sends nothing)::
     ../../venv-py313/bin/python status_report_handler.py
 """
 
-import json
 import logging
 from datetime import date, datetime, timedelta
 
@@ -211,15 +211,6 @@ def subject_for(lines, today):
     return f"Fin-Lambda status {today}: " + ("all ok" if bad == 0 else f"{bad} issue(s)")
 
 
-def to_json(lines, today, generated_at):
-    def enc(v):
-        if isinstance(v, (datetime, date, pd.Timestamp)):
-            return v.isoformat()
-        return _none_if_nan(v)
-    return json.dumps({"asof": str(today), "generated_at": enc(generated_at),
-                       "rows": [{k: enc(v) for k, v in l.items()} for l in lines]}, default=str)
-
-
 # --------------------------------------------------------------------------
 # Database wrappers
 # --------------------------------------------------------------------------
@@ -288,21 +279,8 @@ def inferred_lines(audited_tables):
 def publish_sns(topic_arn, subject, body):
     import boto3
 
+    logging.info("publishing SNS to %s: %s -- %s", topic_arn, subject, body)
     boto3.client("sns").publish(TopicArn=topic_arn, Subject=subject[:100], Message=body)
-
-
-def put_r2_json(payload):
-    import boto3
-
-    bucket = DU.require_env("UPSTREAM_R2_BUCKET")
-    key = DU.env_or("STATUS_R2_KEY", "status/latest.json")
-    client = boto3.client("s3", endpoint_url=DU.require_env("R2_ENDPOINT"),
-                          aws_access_key_id=DU.require_env("R2_ACCESS_KEY_ID"),
-                          aws_secret_access_key=DU.require_env("R2_SECRET_ACCESS_KEY"),
-                          region_name="auto")
-    client.put_object(Bucket=bucket, Key=key, Body=payload.encode("utf-8"),
-                      ContentType="application/json")
-    return f"{bucket}/{key}"
 
 
 # --------------------------------------------------------------------------
@@ -311,7 +289,7 @@ def put_r2_json(payload):
 def run(event, context):
     """Lambda entry point.
 
-    Event keys: ``localrun`` / ``dbFlag=False`` (print only: no SNS, no R2),
+    Event keys: ``localrun`` / ``dbFlag=False`` (print only: no SNS),
     ``asof`` (YYYY-MM-DD report date), ``NYTIME`` (injected clock), ``test``
     (DEBUG logging). Returns a JSON-serialisable summary.
     """
@@ -341,9 +319,10 @@ def run(event, context):
     subject = subject_for(lines, today) + (" (view unreadable)" if error else "")
     print(body)
 
-    delivered = {"sns": False, "r2": None}
+    delivered = {"sns": False}
     if send:
         topic = DU.env_or("STATUS_TOPIC_ARN", None)
+        logging.info("STATUS_TOPIC_ARN: %s", topic)
         if topic:
             try:
                 publish_sns(topic, subject, body)
@@ -352,10 +331,6 @@ def run(event, context):
                 logging.error("SNS publish failed", exc_info=True)
         else:
             logging.warning("STATUS_TOPIC_ARN is not set; no e-mail sent")
-        try:
-            delivered["r2"] = put_r2_json(to_json(lines, today, DU.utc_now()))
-        except Exception:
-            logging.error("R2 status upload failed", exc_info=True)
 
     counts = pd.Series([l["status"] for l in lines]).value_counts().to_dict() if lines else {}
     return {"asof": str(today), "subject": subject, "lines": len(lines),
@@ -364,4 +339,5 @@ def run(event, context):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run({"localrun": True}, None)
+    # dbFlag=False is the off-switch: read v_load_status, print, send nothing.
+    run({"localrun": False, "dbFlag": True}, None)

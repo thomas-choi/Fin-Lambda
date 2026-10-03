@@ -118,7 +118,6 @@ FAKE_ENV = {
     "EOD_BATCH": "200",
     "OPT_SHARDS": "3",
     "OPT_RAW_PREFIX": "raw/optchain",
-    "STATUS_R2_KEY": "status/latest.json",
     # Lists
     "PROD_LIST_DIR": str(HANDLER_DIR),
     "SYMBOLLIST": "system",

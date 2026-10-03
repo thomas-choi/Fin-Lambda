@@ -7,6 +7,101 @@ Newest first.
 
 ---
 
+## 2026-10-02 — statusReport: R2 JSON archive removed, e-mail only
+
+### Goal
+
+`statusReport` delivered the same report twice: as an SNS e-mail and as
+`status/latest.json` in Cloudflare R2. The R2 copy was redundant — the report is
+a formatted projection of `GlobalMarketData.load_audit` (via `v_load_status`),
+which already holds every figure in it, keyed and queryable for any past day,
+while the JSON file was overwritten each run and so kept no history at all. It
+also made the only non-collector function depend on four R2 env vars and on a
+third-party endpoint being reachable, for no data that was not already in MySQL.
+Dropping it leaves `load_audit` as the single source of record for load status.
+
+### Implementation detail
+
+`Ops/fin-deep-data/status_report_handler.py`:
+
+- Deleted `put_r2_json()` and `to_json()` (the latter existed only to build the
+  R2 payload) and the now-unused `import json`.
+- `run()` returns `{..., sns}` instead of `{..., sns, r2}`, and its delivery
+  block no longer has the second `try/except`. `localrun` / `dbFlag=False` still
+  mean print-only; the only remaining side effect is the SNS publish.
+- Module and `run()` docstrings say so, and name `load_audit` as the durable copy.
+- `__main__` now passes `{"localrun": True, "dbFlag": False}` instead of
+  `{"localrun": False}`. The old event set `send=True`, so a local "dry run"
+  would publish SNS whenever `STATUS_TOPIC_ARN` was exported and did attempt the
+  R2 upload — the same class of footgun as the 2026-10-01 `port_assets_handler`
+  incident (`doc/OPERATIONS.md` §8). This is the last `fin-deep-data` `__main__`
+  that was not already an off-switch.
+
+Configuration: `STATUS_R2_KEY` removed from `Ops/fin-deep-data/.env.example`
+(with a comment recording why) and from the local `.env`, so it stops being
+pushed into the Lambda environment by `serverless-dotenv-plugin`. The
+`statusReport` comment in `serverless.yml` no longer advertises R2 JSON. No IAM
+change: R2 is reached with access keys, never the execution role, so the only
+statement that function needs is the existing `sns:Publish`. `UPSTREAM_R2_BUCKET`
+and the three `R2_*` credentials stay — `optChainEOD` still archives raw chains.
+
+### Related files
+
+- `Ops/fin-deep-data/status_report_handler.py`
+- `Ops/fin-deep-data/tests/unit/test_status_report_handler.py`
+- `Ops/fin-deep-data/tests/conftest.py`
+- `Ops/fin-deep-data/.env.example`, `Ops/fin-deep-data/serverless.yml`
+- `doc/TECHNICAL-DESIGN.md`, `doc/OPERATIONS.md`, `doc/PRODUCT-GUIDE.md`,
+  `doc/API-REFERENCE.md`, `CLAUDE.md`, `PLAN-SR-UPSTREAM.md`
+
+### Test coverage
+
+Removed, and announced as obsolete:
+
+- `test_to_json_is_serialisable` — `to_json()` no longer exists.
+- The `put_r2_json` stub in `test_run_sends_sns_and_r2` (renamed
+  `test_run_sends_sns`) and in `test_run_delivery_failures_are_logged_not_raised`,
+  along with their `out["r2"]` assertions. That test's payload assertion
+  (`'"asof": "2026-09-25"' in sent["payload"]`) is replaced by one on the e-mail
+  body, which is now the only delivered artefact.
+- `STATUS_R2_KEY` from the `env` fixture in `tests/conftest.py`.
+- `doc/OPERATIONS.md` §9's `statusReport returns r2: null` troubleshooting row is
+  marked impossible rather than deleted: seeing it now means a pre-2026-10-02
+  package is still deployed.
+
+Added:
+
+- `test_run_has_no_r2_upload_path` — asserts neither `put_r2_json` nor `to_json`
+  is reachable on the module and that a sending run's return value carries no
+  `r2` key, so the upload cannot be reintroduced unnoticed.
+- `test_run_combines_shards_and_sweep` and the SNS test now assert
+  `"r2" not in out`, pinning the new return contract.
+
+Verification, all in `venv-py313` from `Ops/fin-deep-data`:
+
+- `tests/unit/test_status_report_handler.py` — 23 passed (was 23: one test
+  removed, one added). Full root suite **320 passed, 1 skipped**, unchanged.
+- Warning gate clean: `-W error::FutureWarning:status_report_handler
+  -W error::DeprecationWarning:status_report_handler` — 23 passed.
+- `py_compile` and a clean `import` from the service folder.
+- `__main__` dry run against live MySQL: read `v_load_status` plus six
+  `MAX(date)` queries, printed nine lines (`OptionChains_shadow` ok 810/810,
+  `histdailyprice7_shadow` ok 837/837, `corp_action_daily` ok, six inferred,
+  `USRates` stale), sent nothing, wrote nothing.
+- `serverless print` succeeds (only the known `python3.13` validation warnings)
+  and `STATUS_R2_KEY` no longer appears in the rendered environment.
+
+No golden-CSV diff applies: `statusReport` writes no CSV.
+
+### Follow-up for the deploy
+
+`serverless deploy function -f statusReport` is enough — no layer rebuild, since
+nothing in `finDeepCore` changed. Until that redeploy the live package still
+carries the R2 path, which is harmless (`UPSTREAM_R2_BUCKET` is unset, so it
+logs one error per run). The schedule remains `enabled: false`.
+
+---
+
 ## 2026-10-02 — PLAN-SR-UPSTREAM Phase D: the report body and its cases written down
 
 ### Goal

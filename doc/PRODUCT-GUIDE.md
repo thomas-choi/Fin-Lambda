@@ -9,6 +9,7 @@ for data consumers — no handler names, no SQLAlchemy, no event flags.
 
 ## Changelog
 
+- 2026-10-02 | Modified | Dataset catalogue and *Daily load-status report*: the report is e-mail only — the `status/latest.json` R2 archive is retired; `v_load_status` is where consumers read the same figures.
 - 2026-10-01 | Added | *Daily prices and option chains — collection in trial*: a **Which symbols are covered** subsection — delisted symbols leave the universe, option chains narrow to symbols flagged as having options, and the figure is 863 symbols, not 857.
 - 2026-10-01 | Modified | Dataset catalogue and *Corporate actions*: the universe is ~863 symbols; both now point at the coverage rules rather than quoting a bare count.
 - 2026-08-01 | Added | Initial file: dataset catalogue, full entry for index membership (S&P 500 / NASDAQ-100), as-of query recipe, coverage caveats.
@@ -29,7 +30,7 @@ for data consumers — no handler names, no SQLAlchemy, no event flags.
 | **EOD option chains** | `GlobalMarketData.OptionChains` | daily, after the US close | same evening; filtered, see below |
 | **Corporate actions** | `GlobalMarketData.corp_action_daily` | daily, only when there is one | ≤ 1 business day |
 | **Load record (per dataset, per symbol)** | `GlobalMarketData.load_audit`, summarised by `GlobalMarketData.v_load_status` | one row per symbol per collection run | minutes after the run |
-| **Daily load-status report** | e-mail, and `status/latest.json` in Cloudflare R2 | weekdays 20:00 ET | — |
+| **Daily load-status report** | e-mail (the same figures stay queryable in `v_load_status`) | weekdays 20:00 ET | — |
 | FX spot | `GlobalMarketData.FX_snapshot` | hourly | ~1 hour; latest only |
 | FX daily history | `GlobalMarketData.FX_histdaily` | daily | 1 day |
 | US interest rates | `GlobalMarketData.USRates` | daily, weekdays | 1 day |
@@ -191,7 +192,11 @@ the last run started and finished, how many symbols succeeded out of how many
 were expected, and the row count.
 
 **The daily report** turns the same view into one line per dataset, mailed every
-weekday at 20:00 ET and written to `status/latest.json` in R2. Each line reads
+weekday at 20:00 ET. The e-mail is a convenience copy, not the record: it is
+built from `v_load_status`, so anything it shows can be queried there at any
+time, for any past day. (Until 2026-10-02 each report was also archived as
+`status/latest.json` in Cloudflare R2; that file is no longer written or
+updated.) Each line reads
 `ok`, `partial` (some symbols did not finish), `error`, or `stale` (the last data
 is older than the previous weekday). Two caveats: holidays are not modelled, so
 the day after a US holiday can read `stale`; and datasets that only write when

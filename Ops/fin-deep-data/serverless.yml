@@ -189,7 +189,7 @@ functions:
             sweep: true
 
   statusReport:
-      # One line per data set from v_load_status -> SNS e-mail + R2 JSON.
+      # One line per data set from v_load_status -> SNS e-mail (and stdout).
     handler: status_report_handler.run
     runtime: python3.13
     timeout: 120

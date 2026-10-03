@@ -57,7 +57,7 @@ own (`doc/OPERATIONS.md` §10.4.1). The times below are when a schedule fires
 |---|---|---|---|
 | eodDaily | `eod_daily_handler.run` | 18:30 Mon-Fri + sweep 19:00 | daily bars → `$EOD_WRITE_TBL`, actions → `corp_action_daily` |
 | optChainEOD | `optchain_eod_handler.run` | dispatch 17:40, sweeps 18:40/19:40 | filtered EOD chains → `$OPT_WRITE_TBL`, raw → R2. Dispatcher fans out `OPT_SHARDS` async shards; `reservedConcurrency` is **commented out** — the account quota forbids it (TODOS 2.13) |
-| statusReport | `status_report_handler.run` | 20:00 Mon-Fri | `v_load_status` → SNS e-mail + R2 JSON |
+| statusReport | `status_report_handler.run` | 20:00 Mon-Fri | `v_load_status` → SNS e-mail + stdout. No R2: `load_audit` is the durable copy (2026-10-02) |
 | portAssetsHandlerv2 | `port_assets_handler.run` | 18:30 | SP500/NDX100 **+ DJIA + HSI** → `Trading.portfolio_assets_info` |
 | usrateHandlerv2 | `usrate_handler.run` | 17:05 | H.15 scrape → `$TBLUSRATES` |
 | FXHistHandlerv2 | `fxeod_handler.run` | 17:10 | FX daily EOD → `$TBLHISTFX` |
@@ -246,7 +246,7 @@ Groups: DB (`DBHOST`, `DBPORT`, `DBUSER`, `DBPWD`, `DBMKTDATA`, `DBTRADING`, `DB
 
 The MySQL server runs with **`sql_require_primary_key=ON`**, so `StoreEOD`'s `to_sql(if_exists='append')` can never auto-create a table: any new target table must be created manually with a primary key first.
 
-`Ops/fin-deep-data/.env` adds, on top of the groups above: write targets (`EOD_WRITE_TBL`, `OPT_WRITE_TBL`, `TBLLOADAUDIT`, `TBLCORPACTION` — all **required, no fallback**, so `dataUtil.require_env` raises at startup rather than letting the string `None` reach SQL) · list and sharding (`SYMBOL_PROC_VER`, `EOD_SHARDS`, `EOD_BATCH`, `OPT_SHARDS`, `OPT_MAX_PARALLEL`) · upstream storage (`UPSTREAM_R2_BUCKET`, `OPT_RAW_PREFIX`, `STATUS_R2_KEY`) · status (`STATUS_EMAIL`; `STATUS_TOPIC_ARN` is injected by CloudFormation, never put it in `.env`) · index membership (`DJIA_PORT_NAME`, `HSI_PORT_NAME`) · layers (`FINDEEPCORE_LAYER_ARN`, `FINDEEPYF_LAYER_ARN`, `FINDEEPWEB_LAYER_ARN`). There, `PROD_LIST_DIR` is left **empty** on purpose: `dataUtil.list_dir()` then uses the packaged folder, which is correct both on Lambda and locally.
+`Ops/fin-deep-data/.env` adds, on top of the groups above: write targets (`EOD_WRITE_TBL`, `OPT_WRITE_TBL`, `TBLLOADAUDIT`, `TBLCORPACTION` — all **required, no fallback**, so `dataUtil.require_env` raises at startup rather than letting the string `None` reach SQL) · list and sharding (`SYMBOL_PROC_VER`, `EOD_SHARDS`, `EOD_BATCH`, `OPT_SHARDS`, `OPT_MAX_PARALLEL`) · upstream storage (`UPSTREAM_R2_BUCKET`, `OPT_RAW_PREFIX` — optChainEOD only; `STATUS_R2_KEY` was removed 2026-10-02 with statusReport's R2 upload) · status (`STATUS_EMAIL`; `STATUS_TOPIC_ARN` is injected by CloudFormation, never put it in `.env`) · index membership (`DJIA_PORT_NAME`, `HSI_PORT_NAME`) · layers (`FINDEEPCORE_LAYER_ARN`, `FINDEEPYF_LAYER_ARN`, `FINDEEPWEB_LAYER_ARN`). There, `PROD_LIST_DIR` is left **empty** on purpose: `dataUtil.list_dir()` then uses the packaged folder, which is correct both on Lambda and locally.
 
 `Ops/fin-cron-Pgsql/dataUtil_Pgsql.py` hardcodes an absolute macOS dotenv path (`/Users/huangjunyi/...`) that does not exist in this WSL environment, and reads a different key set (`RHOST`, `DB`, `PORT`) — that folder cannot run locally without fixing this first.
 

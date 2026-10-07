@@ -24,7 +24,13 @@ Changed from the originals beyond the audit row and the merge:
   exchange raised ``KeyError`` and lost the rest of the run's symbols;
 * ``run()`` returns a JSON-serialisable summary instead of ``None``;
 * ``InitialRun`` is passed down the call chain instead of being a module global
-  mutated by ``run()``.
+  mutated by ``run()``;
+* a watermark further back than :data:`MAX_INTRADAY_DAYS` is clamped forward
+  (2026-10-07). The originals passed it straight to yfinance, which made Yahoo
+  reject the request and stalled that symbol permanently;
+* ``30min_<sym>.csv`` holds the frame that would be stored, not the raw download
+  (2026-10-08) -- so a dry run shows ``Datetime`` as the table holds it,
+  exchange-local and tz-naive, next to ``UTCDatetime`` and ``timezone``.
 
 Runs on **python3.13** with the ``finDeepCore`` + ``finDeepYf`` layers.
 
@@ -83,10 +89,26 @@ def yf_get_max_datetime(localnow, sym=None):
 
     mkt_datetime = DU.get_Max_datetime(f'{DBMKTDATA}.{TBLMINUTEPRICE}', sym)
     logging.info(f"Max date of {sym} at {DBMKTDATA}.{TBLMINUTEPRICE} is {mkt_datetime}")
+    floor = localnow - timedelta(days=MAX_INTRADAY_DAYS)
     if mkt_datetime is None:
-        Sdatetime = localnow - timedelta(days=MAX_INTRADAY_DAYS)
+        Sdatetime = floor
     else:
         Sdatetime = mkt_datetime
+        # Yahoo serves no 15m bar older than 60 days, and it rejects the *whole*
+        # request (HTTP 422) rather than truncating it when the window starts
+        # further back. So a symbol whose watermark has fallen behind downloads
+        # nothing -- and because nothing is written its watermark never moves, so
+        # it never recovers on its own. 61 of 803 symbols were stuck this way on
+        # 2026-10-07, the oldest since 2025-05-12 (doc/OPERATIONS.md 8.9).
+        # The watermark is naive exchange-local time; compare in the same terms.
+        if mkt_datetime.tzinfo is None:
+            floor = floor.replace(tzinfo=None)
+        if Sdatetime < floor:
+            logging.warning(
+                f"{sym}: watermark {mkt_datetime} is further back than the "
+                f"{MAX_INTRADAY_DAYS}-day intraday limit -- starting at {floor} instead. "
+                f"Yahoo cannot serve the bars in between")
+            Sdatetime = floor
     logging.debug(f"maxdate : {Sdatetime} for {DBMKTDATA}.{TBLMINUTEPRICE} : {sym}")
     return Sdatetime
 
@@ -172,6 +194,23 @@ def reshape_bars(sDF, sym, exchange, tz, sdatetime, edatetime):
     return sDF
 
 
+def _as_stored(sDF):
+    """The frame as MySQL holds it, for the dry-run CSV.
+
+    ``reshape_bars`` leaves ``UTCDatetime`` tz-aware while ``Datetime`` is already
+    naive, and PyMySQL formats a datetime with ``strftime``, so the offset is
+    dropped on the way in and the column lands as that UTC wall time -- both
+    table columns are plain ``datetime``. The CSV drops it too, so a dry run shows
+    what a ``SELECT`` returns. Only the CSV: the write path keeps the tz-aware
+    column, because the still-live python3.10 handlers build the same frame and
+    the stored value is identical either way.
+    """
+    out = sDF.copy()
+    if len(out) and getattr(out["UTCDatetime"].dt, "tz", None) is not None:
+        out["UTCDatetime"] = out["UTCDatetime"].dt.tz_localize(None)
+    return out
+
+
 def _cap(event):
     """``test: N`` caps the symbol count for a dry run; ``test: true`` only raises logging."""
     value = event.get("test")
@@ -223,12 +262,24 @@ def common_fetch_eod(sdatetime, tdatetime, list_name, localrun, dbFlag=True,
             logging.debug(f'Loading {sym} minute OHLC from Yahoo {sdatetime} to {edatetime}!   localnow={localnow}')
 
             sDF = yf_download(sym, sdatetime, edatetime, InitialRun=InitialRun)
-            if localrun:
-                sDF.to_csv(os.path.join(DU.out_dir(localrun), f"30min_{sym}.csv"), index=False)
-
             logging.info(f"{sym} is downloaded DF : {len(sDF)} records")
             if len(sDF) > 0:
                 sDF = reshape_bars(sDF, sym, exchange, tz, sdatetime, edatetime)
+                logging.info(f"{sym} is in window     : {len(sDF)} records")
+            else:
+                # Normalise the empty download, so a 0-row dry run still writes a
+                # CSV with the table's header rather than yfinance's.
+                sDF = pd.DataFrame(columns=SAVE_COLUMNS)
+            if localrun:
+                # The CSV is the only view a dry run gives of the rows, so it holds
+                # what the table would receive: SAVE_COLUMNS, and `Datetime` tz-naive
+                # in the exchange's own time beside the UTC instant. It used to be
+                # written before the reshape, i.e. yfinance's UTC-indexed download
+                # with none of the derived columns, which made a dry run unable to
+                # show the one thing worth checking -- that the localisation in
+                # `reshape_bars` came out right (2026-10-08).
+                _as_stored(sDF).to_csv(os.path.join(DU.out_dir(localrun), f"30min_{sym}.csv"),
+                                      index=False)
             if len(sDF) > 0:
                 if len(sDF) > PER_SYMBOL_WRITE_MIN and dbFlag:
                     DU.StoreEOD(sDF, None, TBLMINUTEPRICE)
@@ -239,13 +290,18 @@ def common_fetch_eod(sdatetime, tdatetime, list_name, localrun, dbFlag=True,
     if len(datallist) > 0:
         totalDF = pd.concat(datallist)
         if localrun:
-            totalDF.to_csv(os.path.join(DU.out_dir(localrun), f"30min_{list_name}.csv"),
-                           index=False)
+            _as_stored(totalDF).to_csv(
+                os.path.join(DU.out_dir(localrun), f"30min_{list_name}.csv"), index=False)
         if dbFlag:
             DU.StoreEOD(totalDF, None, TBLMINUTEPRICE)
             stored.append(totalDF)
 
-    logging.info(f'common_fetch_eod finish the handle {list_name} UPTO {tdatetime}')
+    # `stored` holds what went to the table, so it is empty on a dry run. Log the
+    # collected total as well, or a dry run cannot tell "nothing downloaded" from
+    # "writes are off".
+    n_collected = sum(len(f) for f in datallist) + sum(len(f) for f in stored)
+    logging.info(f'common_fetch_eod finish the handle {list_name} UPTO {tdatetime}: '
+                 f'{n_collected} row(s) collected, {sum(len(f) for f in stored)} stored')
     return stored
 
 

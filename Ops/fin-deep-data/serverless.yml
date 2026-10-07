@@ -119,7 +119,7 @@ functions:
       # 18:30 ET: >= 60 min after the NYSE close in every season (L2).
       # EOD_SHARDS=1 -- the full V4 list is ~15 batched downloads.
       - schedule:
-          enabled: false             # verify by hand, then flip to true
+          enabled: true             # verify by hand, then flip to true
           method: scheduler
           rate: cron(30 18 ? * MON-FRI *)
           timezone: America/New_York
@@ -128,7 +128,7 @@ functions:
             of: 1
       # Sweep: retries every symbol with no ok/empty load_audit row today.
       - schedule:
-          enabled: false             # enable together with the 18:30 entry
+          enabled: true             # enable together with the 18:30 entry
           method: scheduler
           rate: cron(0 19 ? * MON-FRI *)
           timezone: America/New_York
@@ -167,21 +167,21 @@ functions:
       # 17:40 ET, production's summer time, held fixed across DST. The
       # dispatcher async-invokes OPT_SHARDS copies of this function.
       - schedule:
-          enabled: false             # verify by hand, then flip to true
+          enabled: true             # verify by hand, then flip to true
           method: scheduler
           rate: cron(40 17 ? * MON-FRI *)
           timezone: America/New_York
           input:
             dispatch: true
       - schedule:
-          enabled: false             # enable together with the dispatch entry
+          enabled: true             # enable together with the dispatch entry
           method: scheduler
           rate: cron(40 18 ? * MON-FRI *)
           timezone: America/New_York
           input:
             sweep: true
       - schedule:
-          enabled: false             # enable together with the dispatch entry
+          enabled: true             # enable together with the dispatch entry
           method: scheduler
           rate: cron(40 19 ? * MON-FRI *)
           timezone: America/New_York
@@ -204,7 +204,7 @@ functions:
         Ref: StatusTopic
     events:
       - schedule:
-          enabled: false             # verify by hand, then flip to true
+          enabled: true             # verify by hand, then flip to true
           method: scheduler
           rate: cron(0 20 ? * MON-FRI *)
           timezone: America/New_York
@@ -237,7 +237,7 @@ functions:
       # check catches every change within one business day. Only-on-change
       # makes a no-change day nearly free: a few fetches, one SELECT, exit.
       - schedule:
-          enabled: false             # cutover: retire portAssetsHandler first
+          enabled: true             # cutover: retire portAssetsHandler first
           method: scheduler
           rate: cron(30 18 ? * MON-FRI *)
           timezone: America/New_York
@@ -275,7 +275,7 @@ functions:
     events:
       # 17:10 ET, matching the old 21:10 UTC entry in EDT.
       - schedule:
-          enabled: false             # cutover: retire FXHistHandler first
+          enabled: true             # cutover: retire FXHistHandler first
           method: scheduler
           rate: cron(10 17 ? * MON-FRI *)
           timezone: America/New_York

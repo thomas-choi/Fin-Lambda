@@ -1,6 +1,6 @@
 # PLAN-SR-UPSTREAM — Fin-Lambda upstream track for Support-Resistance-Agent
 
-Status: **RE-IMPLEMENTED 2026-10-01 in the new service `Ops/fin-deep-data` (python3.13). Phases A–F done and tested there; not deployed. Next: owner publishes the three `finDeep*` layers and records their ARNs in `Ops/fin-deep-data/.env`, sets `STATUS_EMAIL`, then P7, P10, P13 and the shadow deploy (G1/U5).**
+Status: **SHADOW RUN LIVE (G1/U5) as of 2026-10-06.** Phases A–F done and tested in `Ops/fin-deep-data` (python3.13); the service was deployed 2026-10-01 and the three new functions — `eodDaily`, `optChainEOD`, `statusReport` — are now enabled against the `*_shadow` tables, with the SNS e-mail subscription confirmed. The five v2 ports remain disabled pending their per-data-set cutover (`doc/OPERATIONS.md` §11.2). Current enable state, and the three issues it surfaces, are in *Live enable state* below. Next: finish the ten-session shadow diff, then U6 cutover → U2b prepend → U7 archive.
 
 > **2026-10-01 — re-implementation.** The owner added constraints that the
 > 2026-09-25 implementation did not meet: no deployed function or layer of
@@ -34,6 +34,83 @@ Status: **RE-IMPLEMENTED 2026-10-01 in the new service `Ops/fin-deep-data` (pyth
 Revised 2026-09-25: added the Python 3.13 policy and moved every resource requirement into the Pre-Phase.
 Owner: Thomas Choi
 Sources: `Support-Resistance-Agent/docs/BUILD-PLAN.md` §17.2 A7/A8, `SR_Technical_Document.md` §4.5.7
+
+## Live enable state — old vs. new functions and the tables they write
+
+Verified against AWS on **2026-10-06** (`aws scheduler list-schedules` for
+`fin-deep-data`, `aws events list-rules` for `fin-cron-data`, both
+`us-east-2` / profile `ServerLessUser`). This is the authoritative state table;
+`doc/OPERATIONS.md` §10.5 lists the *intended* times, which is not the same
+thing.
+
+**The shadow run (G1/U5) is live.** `eodDaily`, `optChainEOD` and
+`statusReport` are enabled and writing to `*_shadow` tables while the droplet
+cron keeps writing production. The SNS e-mail subscription is **confirmed**.
+
+### Paired data sets — one table, two possible writers
+
+Each row is a data set whose new writer exists. `BOTH ENABLED` on any row means
+duplicate rows in that table; `BOTH DISABLED` means the data set has no writer
+at all.
+
+| Data set | Table written | Old function (`fin-cron-data`, py3.10) | Old state | New function (`fin-deep-data`, py3.13) | New state | Status |
+|---|---|---|---|---|---|---|
+| Daily bars | `GlobalMarketData.histdailyprice7` → shadow: `histdailyprice7_shadow` | *(none — droplet cron in myFinData)* | ENABLED (host cron) | `eodDaily` 18:30 + 19:00 sweep | **ENABLED** | **Shadow run** — no collision: new writer is on `_shadow` |
+| Corporate actions | `GlobalMarketData.corp_action_daily` | *(none — new data set)* | — | `eodDaily` | **ENABLED** | New data set, writes production directly |
+| EOD option chains | `GlobalMarketData.OptionChains` → shadow: `OptionChains_shadow` | *(none — droplet cron in myFinData)* | ENABLED (host cron) | `optChainEOD` 17:40 + 18:40 sweep + 19:40 sweep | **ENABLED (2 of 3)** | **Shadow run**, but the 19:40 sweep is DISABLED — see below |
+| Load status report | *(reads `v_load_status`; writes nothing)* | *(none — new function)* | — | `statusReport` 20:00 | **ENABLED** | SNS e-mail only; `load_audit` is the durable copy |
+| Index membership | `Trading.portfolio_assets_info` | `portAssetsHandler` 22:30 UTC | **DISABLED** | `portAssetsHandlerv2` 18:30 ET | **DISABLED** | ⚠️ **BOTH DISABLED — no writer. SP500/NDX100 have stopped updating, and DJIA/HSI never started (§5.12).** |
+| US interest rates | `GlobalMarketData.USRates` | `usrateHandler` 21:01 UTC | ENABLED | `usrateHandlerv2` 17:05 ET | DISABLED | Correct — awaiting §11.2 cutover |
+| FX daily EOD | `GlobalMarketData.FX_histdaily` | `FXHistHandler` 21:10 UTC | ENABLED | `FXHistHandlerv2` 17:10 ET | DISABLED | Correct — awaiting §11.2 cutover |
+| US 15-min bars | `GlobalMarketData.histminprice` | `yfus30minEOD` 00:05 UTC | ENABLED | `yfus30minEODv2` 20:05 ET | DISABLED | Correct — awaiting §11.2 cutover |
+| Asia 15-min bars | `GlobalMarketData.histminprice` | `yfasia30minEOD` 10:00 UTC | ENABLED | `yfasia30minEODv2` 06:00 ET | DISABLED | Correct — awaiting §11.2 cutover |
+
+### Unpaired — old functions with no 3.13 successor yet
+
+These are what TODOS §5.10 still has to port before `python3.10` is blocked
+from redeploy.
+
+| Data set | Table written | Old function | Old state | Note |
+|---|---|---|---|---|
+| Stock/ETF snapshot | `GlobalMarketData.snapshot` (delete-then-append) | `cronHandler` 0/10 at 13-21 + 21-00 | ENABLED | Table name is **hardcoded** in `handler.py:146`, not read from `TBLSNAPSHOOT` |
+| Options snapshot | `GlobalMarketData.options_snapshot` (delete-then-append) | `optHandler` 0/10 at 12-21 | ENABLED | Table name hardcoded in `opt_handler.py:140` |
+| FX spot snapshot | `GlobalMarketData.FX_snapshot` (delete-then-append) | `FXrateHandler` hourly | ENABLED | `TBLFXSNAPSHOT` |
+| Fama-French 3-factor | `GlobalMarketData.famaFrench` | `fffHandler` monthly, 1st | ENABLED | ⚠️ Schedule is enabled but the handler **cannot run** — `NameError` on every invocation (TODOS §4.1) |
+| News | S3 / Cloudflare R2 | `yfNewshandler` hourly | ENABLED | No DB table |
+
+### Schedule-level detail for the three enabled new functions
+
+| Schedule | Expression (`America/New_York`) | State |
+|---|---|---|
+| `EodDailySchedulerSchedule1` | `cron(30 18 ? * MON-FRI *)` | ENABLED |
+| `EodDailySchedulerSchedule2` (sweep) | `cron(0 19 ? * MON-FRI *)` | ENABLED |
+| `OptChainEODSchedulerSchedule1` (dispatch) | `cron(40 17 ? * MON-FRI *)` | ENABLED |
+| `OptChainEODSchedulerSchedule2` (sweep +60) | `cron(40 18 ? * MON-FRI *)` | ENABLED |
+| `OptChainEODSchedulerSchedule3` (sweep +120) | `cron(40 19 ? * MON-FRI *)` | **DISABLED** |
+| `StatusReportSchedulerSchedule1` | `cron(0 20 ? * MON-FRI *)` | ENABLED |
+
+### Three things this state table surfaces
+
+1. **`serverless.yml` still says `enabled: false` for all eleven schedules.**
+   The three enabled ones were enabled outside the repo, so the next
+   `cd Ops/fin-deep-data && serverless deploy` silently reverts them to
+   DISABLED and the shadow run stops with no error. Either set `enabled: true`
+   on those four entries (eodDaily ×2, optChainEOD dispatch + sweep1,
+   statusReport) to match reality, or do not deploy this service until the
+   shadow run ends.
+2. **`optChainEOD`'s 19:40 sweep is DISABLED while its dispatch and 18:40 sweep
+   are ENABLED.** `doc/OPERATIONS.md` §10.4.1 says to enable all of a
+   function's entries together: a symbol that fails both the 17:40 dispatch and
+   the 18:40 sweep now has no third attempt, so the shadow diff will show gaps
+   that are an artefact of the half-enablement rather than a real defect.
+3. **Account Lambda `ConcurrentExecutions` is still 10** (re-checked
+   2026-10-06), and `optChainEOD` is enabled with `OPT_SHARDS=4` and no
+   `reservedConcurrency` — the exact condition TODOS §2.13 said to fix *before*
+   enabling it. Four shards plus the 18:40 sweep draw from the same pool of 10
+   that the nine live `fin-cron-data` functions use, and `cronHandler` /
+   `optHandler` both fire every 10 minutes through that window. Expect
+   `TooManyRequestsException` throttles on either side. Raise the quota
+   (Service Quotas `L-B99A9384` → 1000) as the fix.
 
 ## Context
 

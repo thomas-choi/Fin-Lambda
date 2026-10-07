@@ -9,6 +9,8 @@ for data consumers — no handler names, no SQLAlchemy, no event flags.
 
 ## Changelog
 
+- 2026-10-07 | Modified | the dataset catalogue's intraday-bars row: 61 symbols carry a history gap, and bars older than 60 days cannot be back-filled from the source.
+- 2026-10-06 | Modified | the dataset catalogue's FX daily history freshness: same evening after 17:10 ET, and a missed day arrives with the next day's run.
 - 2026-10-02 | Modified | Dataset catalogue and *Daily load-status report*: the report is e-mail only — the `status/latest.json` R2 archive is retired; `v_load_status` is where consumers read the same figures.
 - 2026-10-01 | Added | *Daily prices and option chains — collection in trial*: a **Which symbols are covered** subsection — delisted symbols leave the universe, option chains narrow to symbols flagged as having options, and the figure is 863 symbols, not 857.
 - 2026-10-01 | Modified | Dataset catalogue and *Corporate actions*: the universe is ~863 symbols; both now point at the coverage rules rather than quoting a bare count.
@@ -25,14 +27,14 @@ for data consumers — no handler names, no SQLAlchemy, no event flags.
 | **Index membership (S&P 500, NASDAQ-100, DJIA, Hang Seng)** | `Trading.portfolio_assets_info` | checked daily, **stored only when it changes** | ≤ 1 business day |
 | Stock/ETF snapshot | `GlobalMarketData.snapshot` | every 10 min during US hours | minutes; **latest snapshot only, no history** |
 | Options snapshot | `GlobalMarketData.options_snapshot` | every 10 min during US hours | minutes; latest only |
-| Intraday bars (15 min) | `GlobalMarketData.histminprice` | nightly per market | 1 day |
+| Intraday bars (15 min) | `GlobalMarketData.histminprice` | nightly per market | 1 day. **Coverage is not uniform:** 61 of 803 symbols stopped updating at some point before 2026-08 and resume from mid-2026-08 with a gap in between, because the source serves no 15-minute bar older than 60 days and those gaps cannot be back-filled. Check a symbol's own date range before using it for a continuous series |
 | Daily prices | `GlobalMarketData.histdailyprice7` | daily, after the US close | same evening. ~863 symbols across US, HK, CN, KR, TW, JP and crypto — see *Which symbols are covered* |
 | **EOD option chains** | `GlobalMarketData.OptionChains` | daily, after the US close | same evening; filtered, see below |
 | **Corporate actions** | `GlobalMarketData.corp_action_daily` | daily, only when there is one | ≤ 1 business day |
 | **Load record (per dataset, per symbol)** | `GlobalMarketData.load_audit`, summarised by `GlobalMarketData.v_load_status` | one row per symbol per collection run | minutes after the run |
 | **Daily load-status report** | e-mail (the same figures stay queryable in `v_load_status`) | weekdays 20:00 ET | — |
 | FX spot | `GlobalMarketData.FX_snapshot` | hourly | ~1 hour; latest only |
-| FX daily history | `GlobalMarketData.FX_histdaily` | daily | 1 day |
+| FX daily history | `GlobalMarketData.FX_histdaily` | daily | same evening, after the 17:00 ET FX day roll. A day that is missed arrives with the next day's run, so read the table by `Date` rather than assuming the newest row is yesterday |
 | US interest rates | `GlobalMarketData.USRates` | daily, weekdays | 1 day |
 | Fama-French factors | `GlobalMarketData.famaFrench` | monthly | **currently not updating** — see `TODOS.md` §4.1 |
 | News articles | S3 / Cloudflare R2 | hourly | ~1 hour |

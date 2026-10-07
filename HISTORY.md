@@ -7,6 +7,538 @@ Newest first.
 
 ---
 
+## 2026-10-08 — intraday v2: the dry-run CSV showed the download, not the row
+
+### Goal
+Confirm, and make checkable, that `$TBLMINUTEPRICE.Datetime` holds exchange-local
+time per the row's own `timezone` column — and make a `localrun` CSV show the data
+as the table holds it, which is what the owner asked for.
+
+### Root cause
+Not a defect in what is stored. `reshape_bars()` was correct, and the live table
+agrees: both `Datetime` and `UTCDatetime` are plain MySQL `datetime` with no
+offset, and `Datetime - UTCDatetime` equals the zone's offset on the bar's date.
+
+| Symbol | timezone | `Datetime` | `UTCDatetime` | offset |
+|---|---|---|---|---|
+| `0001.HK` | `Asia/Hong_Kong` | 2026-10-06 16:00:00 | 2026-10-06 08:00:00 | +480 min |
+| `AAPL` | `America/New_York` | 2026-10-06 15:45:00 | 2026-10-06 19:45:00 | −240 min |
+
+The defect was in the **dry run's visibility of it**. `common_fetch_eod` wrote
+`30min_<sym>.csv` immediately after `yf_download` and *before* `reshape_bars`, so
+the file held yfinance's raw UTC-indexed download: no `Symbol`, no `Exchange`, no
+`UTCDatetime`, no `timezone`, no window filter, and a `Datetime` in UTC. The one
+thing the CSV is there to verify — that the localisation came out right — was the
+one thing it could not show. The pooled `30min_<list>.csv` was written *after* the
+reshape, so the two outputs of the same run disagreed about what a row looks like.
+
+Per `CLAUDE.md`, a dry-run CSV is the golden reference a change is diffed against,
+so a reference that is not the frame being written is worth little.
+
+### Implementation detail
+`Ops/fin-deep-data/intraday_min_handler.py`:
+
+* the per-symbol CSV is written after `reshape_bars`, from the same frame that
+  would reach `StoreEOD` — `SAVE_COLUMNS` in table order, `Datetime` tz-naive
+  exchange-local, `UTCDatetime` and `timezone` beside it;
+* an empty download is normalised to `pd.DataFrame(columns=SAVE_COLUMNS)`, so a
+  symbol Yahoo returns nothing for still produces a 0-row CSV with the table's
+  header instead of yfinance's;
+* new `_as_stored()` strips the tz from `UTCDatetime` for **both** CSVs. The
+  column is tz-aware in the frame, and PyMySQL's `strftime` drops the offset on
+  the way in, so the file now matches what a `SELECT` returns. The write path is
+  deliberately untouched: the still-live python3.10 handlers build the identical
+  frame, and the stored value is the same either way, so there is nothing to gain
+  by diverging them mid-cutover;
+* a second log line, `<sym> is in window : <m> records`, next to the existing
+  `is downloaded DF : <n>`. `m = n - 1` is normal — `reshape_bars` drops the bar
+  sitting exactly on the watermark (`Datetime > sdatetime`) — and seeing only `n`
+  made a correct 1-record-in/0-out run look like a failure.
+
+No change to any stored value, to the event contract, or to the table.
+
+### Related files
+* `Ops/fin-deep-data/intraday_min_handler.py`
+* `Ops/fin-deep-data/tests/unit/test_phase_f_handlers.py`
+* `doc/API-REFERENCE.md` (§7.6.1 new, §7.1 `localrun`), `doc/OPERATIONS.md`
+  (§10.6), `doc/TECHNICAL-DESIGN.md` (§6.3)
+
+### Test coverage
+Three tests added to `tests/unit/test_phase_f_handlers.py`:
+
+* `test_intraday_localrun_csv_holds_the_frame_that_would_be_stored` — the CSV
+  carries `SAVE_COLUMNS`, neither datetime column carries an offset, and
+  `Datetime - UTCDatetime` is Hong Kong's +8 on every row;
+* `test_intraday_localrun_csv_of_an_empty_download_has_the_table_header` — a
+  0-row download writes a 0-row CSV with our header;
+* `test_intraday_as_stored_strips_the_utc_offset_only_for_the_csv` — `_as_stored`
+  strips the tz, leaves the source frame tz-aware, and tolerates an empty frame.
+
+The first two fail against the old ordering (`EmptyDataError` / wrong columns),
+checked by reverting the write to the pre-reshape frame. `336 passed, 1 skipped`
+(was 333) under `-W error::FutureWarning:intraday_min_handler
+-W error::DeprecationWarning:intraday_min_handler`; `py_compile`, a clean
+`import`, and `serverless print` all pass.
+
+Dry runs with `dbFlag=False`:
+
+* **Asia** — `1945 row(s) collected, 0 stored`, unchanged from before the change.
+  All six CSVs (five per-symbol + pooled) now have the 11 table columns, no
+  all-NaN column, and the right offset per zone: `08:00` for the four `.HK`
+  symbols, `09:00` for `000270.KS`, both present in the pooled file. `0003.HK`
+  first row `2026-08-10 09:30:00` / `2026-08-10 01:30:00` / `Asia/Hong_Kong`.
+  The 59-day clamp warnings for `0003.HK` / `0005.HK` are still there (§8.9).
+* **US** — five symbols, `1` record downloaded each and `0` in window (the bar on
+  the watermark), `0 row(s) collected`. Each CSV is now a 0-row file with the
+  table header; it would previously have held a raw yfinance row. Correct for a
+  closed market with a current watermark.
+
+### Note on `fin-cron-data`
+The owner confirmed (2026-10-08) that the 60-day limit is handled operationally
+there and that **no change is to be made** to `eoddata_minhandler_{us,asia}.py`.
+Those handlers keep writing the raw per-symbol CSV; the §8.9 clamp and this CSV
+change are `fin-deep-data` only.
+
+---
+
+## 2026-10-07 — intraday v2: a stale watermark stalled a symbol for good
+
+### Goal
+
+`intraday_min_handler.py asia` logged a failed download per old symbol and
+collected nothing for them:
+
+```
+Loading 0003.HK minute OHLC from Yahoo 2025-09-25 16:00:00+08:00 to 2026-10-07 12:34:30+08:00!
+response code=422
+YFPricesMissingError('possibly delisted; no price data found (15m ...)
+  (Yahoo error = "15m data not available for startTime=1758787200 and
+   endTime=1791347618. The requested range must be within the last 60 days.")')
+0003.HK is downloaded DF : 0 records
+```
+
+### Root cause
+
+`yf_get_max_datetime` applied the 60-day intraday limit **only when the table had
+no row for the symbol at all**:
+
+```python
+if mkt_datetime is None:
+    Sdatetime = localnow - timedelta(days=MAX_INTRADAY_DAYS)
+else:
+    Sdatetime = mkt_datetime          # however old it is
+```
+
+`0003.HK`'s watermark was `2025-09-25`, so the request spanned 377 days. Yahoo
+serves no 15m bar older than 60 days and **rejects the whole request** (HTTP 422)
+rather than truncating it, so the download returned nothing — and because nothing
+was written, the watermark did not move. The next run asked for the same
+impossible window. **The stall is permanent and self-perpetuating:** once a
+symbol falls more than 60 days behind, for any reason, it never comes back on its
+own.
+
+**Blast radius — 61 of 803 symbols in `GlobalMarketData.histminprice`** were
+stuck this way, across both markets, measured 2026-10-07:
+
+| | symbols | oldest watermark |
+|---|---|---|
+| fresh (< 60 days) | 742 | 2026-08-14 |
+| **stalled (> 60 days)** | **61** | **2025-05-12** |
+
+By suffix: 36 US-listed, 14 `.HK`, 4 `.L`, 2 each `.SZ` / `.SS` / `.NS`, 1 `.JK`
+— so `yfus30minEOD` is affected as much as the Asia function. The live
+python3.10 pair has the identical logic (`eoddata_minhandler_asia.py:38`), which
+is how the backlog accumulated.
+
+### Implementation detail
+
+`Ops/fin-deep-data/intraday_min_handler.py` — `yf_get_max_datetime` now clamps
+the start forward to `localnow - MAX_INTRADAY_DAYS` whenever the watermark is
+further back, and logs a warning naming the gap Yahoo cannot fill. The
+comparison is done in the watermark's own awareness (MySQL hands back naive
+exchange-local time, `localnow` is tz-aware), so the clamped value stays naive
+and the caller localizes it exactly as before. The `mkt_datetime is None` branch
+is unchanged, including its tz-aware result.
+
+The bars between the old watermark and the 60-day floor **are not recoverable** —
+Yahoo does not serve them. Each affected symbol keeps a one-off hole in its
+history and resumes from the floor; the warning is what makes the hole visible
+rather than silent.
+
+Also, `common_fetch_eod`'s closing log line now reports rows **collected** beside
+rows **stored**. `run()`'s `rows` counts what reached the table, so a dry run
+reports `rows: 0` no matter how much it downloaded, and "nothing downloaded" was
+indistinguishable from "writes are off". No contract changed — the returned
+summary and the audit row are untouched.
+
+`Ops/fin-cron-data/eoddata_minhandler_{us,asia}.py` are **not** touched: that
+folder is frozen per `CLAUDE.md` and the §11.2 cutover retires it. They keep the
+defect, so the stalled set will keep growing slowly until the cutover.
+
+### Related files
+
+- `Ops/fin-deep-data/intraday_min_handler.py`
+- `Ops/fin-deep-data/tests/unit/test_phase_f_handlers.py`
+- `doc/OPERATIONS.md` (§8.9, §9, §10.6), `doc/TECHNICAL-DESIGN.md` (§6.3),
+  `doc/PRODUCT-GUIDE.md` (dataset catalogue)
+
+### Test coverage
+
+**Added** four tests to `tests/unit/test_phase_f_handlers.py`:
+
+- `test_intraday_clamps_a_watermark_past_the_intraday_limit` — the regression:
+  a 2025-09-25 watermark against a 2026-10-07 clock returns the floor, inside 60
+  days, and still tz-naive so the caller's `localize` is unaffected.
+- `test_intraday_keeps_a_watermark_inside_the_limit` — a normal watermark is
+  passed through untouched, so the fix introduces no gap of its own.
+- `test_intraday_empty_table_still_starts_at_the_limit` — the `None` branch keeps
+  its tz-aware result.
+- `test_intraday_stalled_symbol_downloads_inside_the_limit` — end to end through
+  `run()`: the window reaching `yf_download` spans under 60 days, not 377.
+
+The first and last fail against the pre-fix handler (verified by disabling the
+clamp and re-running).
+
+**Existing verification, all re-run:** 333 passed / 1 skipped in
+`Ops/fin-deep-data` (was 329), `py_compile` and a clean `import` in
+`venv-py313`, and `serverless print` succeeds from the service folder.
+
+**Dry run** (`../../venv-py313/bin/python intraday_min_handler.py asia`, event
+`{"localrun": True, "dbFlag": False, "test": 5}` — writes off): the two stalled
+symbols in the capped list went from **0 records to 953 each**, each with the new
+warning; the three fresh symbols were unchanged (11 / 11 / 19 records). Closing
+line: `1944 row(s) collected, 0 stored`. `30min_0003.HK.csv` is 953 x 7 — the
+raw yfinance shape as before — no all-NaN column, `2026-08-10 01:30:00+00:00`
+through `2026-10-07 03:45:00+00:00`, and `reshape_bars` logs exchange-local
+`2026-08-10 09:30:00+08:00` onward. The US dry run (`intraday_min_handler.py`,
+same event) collected 0 rows with no warning and no error, correct for a closed
+market with a current watermark — its first five symbols alphabetically are all
+fresh.
+
+**Not removed:** no verification step, CSV or flag is retired by this change.
+
+---
+
+## 2026-10-06 — `FXHistHandlerv2`: the download window lost today's bar
+
+### Goal
+
+A `fxeod_handler` dry run collected **nothing**: all 16 tickers logged
+`yfinance received OHLC data: EMPTY`, the run finished `rows: 0`, and
+`GlobalMarketData.FX_histdaily` stood at `2026-10-05` with no row for
+2026-10-06.
+
+### Root cause
+
+`yf.download`'s `end` is **exclusive**, and `fx_run` passed the last date it
+wanted as `end`:
+
+```python
+Sdate = mktdate + timedelta(days=1)      # 2026-10-06, the day after the watermark
+fx_df = fetch_exchange_rates(Sdate, mToday, ...)   # mToday = 2026-10-06
+```
+
+With the table loaded through yesterday, `start == end` and the window has zero
+width. Yahoo answers it with no rows at all — confirmed directly:
+
+```
+[2026-09-29, 2026-09-29] -> 0 rows      [2026-10-06, 2026-10-06] -> 0 rows
+[2026-10-02, 2026-10-02] -> 0 rows      [2026-10-07, 2026-10-07] -> 0 rows
+[2026-10-05, 2026-10-05] -> 0 rows      [2026-10-06, 2026-10-07] -> 2 rows
+```
+
+The window collapses this way on **every run whose previous day already has a
+bar** — in steady state, every Tuesday-to-Friday run. It is not specific to
+2026-10-06.
+
+**Why the table is nevertheless almost complete.** Two things covered for it.
+A Monday run's watermark is Friday, so its window spans the weekend and is not
+degenerate; and Yahoo includes the bar sitting *on* `period2` in a non-degenerate
+request (last line above: asking `[10-06, 10-07]` returns both days). Weekday
+runs had only the degenerate request, which Yahoo apparently used to answer with
+the in-progress bar — but never dependably. `first_seen` on the live table shows
+where it did not:
+
+| Date | dow | tickers | first written | lag |
+|---|---|---|---|---|
+| 2026-08-28 | Friday | 16 | 2026-08-29 17:10 | 1 day |
+| 2026-08-31 | Monday | **8** | 2026-08-31 17:10 | 0 |
+| 2026-09-18 | Friday | 16 | 2026-09-19 17:10 | 1 day |
+| 2026-10-06 | Tuesday | **0** | — | missing |
+
+Whether Yahoo changed its handling of a zero-width range on 2026-10-06 or it was
+always a coin flip cannot be determined from here; either way the handler was
+depending on undocumented behaviour for a degenerate request. The fix removes
+the dependency rather than explaining it.
+
+**Blast radius.** The still-live python3.10 `Ops/fin-cron-data/fxeod_handler.py`
+has the identical window and is the function actually writing `FX_histdaily`
+today; `FXHistHandlerv2`'s schedule is still `DISABLED`, so this change moves no
+production data by itself. The failure mode is a **late row, not a wrong one**:
+the next day's window spans two days, so the 2026-10-07 17:10 run collects both
+2026-10-06 and 2026-10-07. The 2026-10-06 gap self-heals; nothing needs
+back-filling, and no bad value was ever stored (the same-day rows that did land
+match Yahoo's final Close exactly — EUR 2026-10-05 `0.88853`, JPY `157.733994`,
+checked against a fresh download).
+
+### Implementation detail
+
+`Ops/fin-deep-data/fxeod_handler.py`:
+
+- `fetch_exchange_rates(start_dt, end_dt, ...)` is now documented and
+  implemented as **inclusive of `end_dt`**: it asks `yf.download` for
+  `end_dt + 1 day` and clamps the result back. The caller is unchanged, so the
+  handler's date rule keeps saying what it means.
+- New `_complete_bars(ddf, end_dt)` does the clamping, and it is not optional
+  housekeeping. With `end = end_dt + 1` Yahoo returns the bar dated
+  `end_dt + 1` as well once the London FX day has rolled — observed at 22:44 ET
+  as a `2026-10-07` row with a NaN `Close`. Storing that row would append junk
+  **and** push the watermark past 2026-10-06, and no later run can repair a
+  watermark that has run ahead. `_complete_bars` therefore drops bars past
+  `end_dt` and bars whose `Close` is still NaN, and returns a copy because the
+  caller adds columns to it.
+- `fx_run` skips the download when `Sdate > mToday` — a same-day re-run — and
+  logs it, instead of sending 16 requests for an inverted window.
+
+`Ops/fin-cron-data/fxeod_handler.py` is **not** touched: that folder is frozen
+per `CLAUDE.md` and the cutover (`doc/OPERATIONS.md` §11.2) retires it. It keeps
+the defect until then, which means further one-day-late FX rows are expected
+there.
+
+### Related files
+
+- `Ops/fin-deep-data/fxeod_handler.py`
+- `Ops/fin-deep-data/tests/unit/test_phase_f_handlers.py`
+- `doc/OPERATIONS.md` (§7, §8.8, §9, §10.6), `doc/TECHNICAL-DESIGN.md` (§6.3),
+  `doc/PRODUCT-GUIDE.md` (dataset catalogue)
+
+### Test coverage
+
+**Added** four tests to `tests/unit/test_phase_f_handlers.py`, all pinning the
+clock through `NYTIME` (17:10 ET, the scheduled time) so the window is
+deterministic rather than dependent on when the suite runs:
+
+- `test_fxeod_asks_one_day_past_the_end_of_the_window` — the regression for this
+  incident: watermark 2026-10-05, asserts the `end` kwarg reaching
+  `yf.download` is `2026-10-07`, not `2026-10-06`, and that the run stores 2
+  rows.
+- `test_fxeod_drops_the_bar_past_the_end_of_the_window` — a `2026-10-07` bar in
+  the response is not stored and does not reach the audit `date_hi`.
+- `test_fxeod_drops_a_forming_bar_with_no_close` — a NaN-`Close` bar is dropped.
+- `test_fxeod_skips_the_download_when_the_table_is_current` — watermark already
+  `mToday`: no `yf.download` call, `ok` with 0 rows, nothing stored.
+
+The first three fail against the pre-fix handler and pass after it (verified by
+reverting the two lines and re-running).
+
+**Existing verification, all re-run:** 329 passed / 1 skipped in
+`Ops/fin-deep-data` (was 325; the skip is the SQLAlchemy-1.4-only `ExecSQL`
+case), with `-W error::FutureWarning:fxeod_handler
+-W error::DeprecationWarning:fxeod_handler` clean. `py_compile` and a bare
+`import fxeod_handler` pass in `venv-py313`. `serverless print` succeeds from
+`Ops/fin-deep-data`.
+
+**Dry run** (`../../venv-py313/bin/python fxeod_handler.py`, the `__main__`
+event `{"localrun": True, "dbFlag": False, "test": "True"}` — writes off):
+**0 rows before the fix, 16 after**, one per ticker, all dated `2026-10-06`,
+the `2026-10-07` forming bar dropped. `USD_dailyFX.csv` is 16 x 10 with the
+same column set and dtypes as before (`Date` + the 8 `FX_COLUMNS` +
+`server_time`), no all-NaN column. Spot-checked against an independent
+download: EUR `Close 0.89150`, JPY `157.962997` — both exact.
+
+**Not removed:** no verification step, CSV or flag is retired by this change.
+
+---
+
+## 2026-10-06 — `usrateHandlerv2`: `localrun` prints the rates
+
+### Goal
+
+A `usrate_handler` dry run told you how many rows it would store and then wrote
+them to `USrates_<date>.csv`. Reading the rates it had just scraped meant
+opening that file — and in the normal intra-day case, when the H.15 page has
+nothing newer than the stored max, there is no file at all (`doc/OPERATIONS.md`
+§7: the page lags the schedule by a business day), so the run printed a row
+count of 0 and nothing else. `localrun` now prints the rates.
+
+### Implementation detail
+
+`Ops/fin-deep-data/usrate_handler.py`:
+
+- New `format_rates(stored, maxdate=None, scraped=None) -> str`. Pure, so it is
+  unit-testable without the Fed or MySQL, and it does not mutate its argument —
+  the caller writes the same frame to CSV afterwards.
+  - It renders **transposed**: one row per instrument, one column per date. The
+    stored shape is `Date` plus 30 instrument columns, which wraps unreadably in
+    a terminal; the H.15 shape fits.
+  - With new rows: `US rates -- <n> new row(s) since <maxdate>` plus the frame.
+  - With none — the normal case — it falls back to `scraped.tail(1)` and says
+    `no new rows since <maxdate>; showing the latest H.15 date, which is already
+    stored`. Printing the watermark alone would have reproduced the problem this
+    change exists to fix.
+  - With neither: one line, `H.15 returned no rows (stored max …)`. This is the
+    only case where a `localrun` prints no rates, so it doubles as the failure
+    signal, recorded as such in `doc/OPERATIONS.md` §10.6.
+- `usrate_run()` prints it when `localrun` is true, **before** the write branch,
+  so the rates reach the screen even if `StoreEOD` or the CSV write fails.
+- `print`, not `logging.info`: the module's `basicConfig(stream=sys.stdout)`
+  would prefix only the first line of a multi-line table and leave the rest
+  unlabelled.
+
+`localrun` stays independent of `dbFlag`, so `{"localrun": true, "dbFlag":
+true}` prints *and* writes. Nothing changes on Lambda: `run()` defaults
+`localrun` to `False`, and the scheduled event sets neither key.
+
+### Related files
+
+- `Ops/fin-deep-data/usrate_handler.py` — `format_rates()`, the `usrate_run()`
+  call site, module / `usrate_run` / `run` docstrings
+- `Ops/fin-deep-data/tests/unit/test_phase_f_handlers.py`
+- `doc/API-REFERENCE.md` §1, `doc/OPERATIONS.md` §10.6
+
+`doc/TECHNICAL-DESIGN.md` and `doc/PRODUCT-GUIDE.md` are deliberately untouched:
+no schedule, `dataUtil` signature, write semantic, table column or data source
+changed, and the stdout of a dry run is not a consumer-facing surface.
+
+### Test coverage
+
+Added to `tests/unit/test_phase_f_handlers.py` (5 tests, all with the H.15 fetch
+and the engine patched — nothing reaches the Fed or MySQL):
+
+- `test_usrate_localrun_prints_the_new_rates` — `{"localrun": True, "dbFlag":
+  False}` puts `US rates -- 2 new row(s) since 2026-09-22` on stdout with the
+  instrument rows and the date column, asserts the output is transposed
+  (`Instrument` present), and asserts no `GROUP_ROWS` header leaked in.
+- `test_usrate_localrun_prints_latest_when_nothing_is_new` — watermark equal to
+  the only scraped date: prints `no new rows since … already stored` plus the
+  rates, and writes **no** CSV. This is the case the change exists for.
+- `test_usrate_without_localrun_prints_nothing` — the Lambda path (`{}`) emits
+  no table, pinning that this cannot start logging 30 rates per scheduled run.
+- `test_usrate_format_rates_handles_an_empty_scrape` — empty frame and `None`
+  both return the one-line form rather than raising.
+- `test_usrate_format_rates_does_not_mutate_its_input` — `assert_frame_equal`
+  before/after, under the no-warning context, because the caller re-uses the
+  frame for the CSV.
+
+No verification removed: the `USrates_<date>.csv` output, its 31-column shape
+and the audit-row tests are unchanged, and the existing
+`test_usrate_dry_run_writes_csv_and_no_audit` still covers them.
+
+Verification, all in `venv-py313` from `Ops/fin-deep-data`:
+
+- `pytest tests/unit` — **325 passed, 1 skipped** (was 320 passed, 1 skipped;
+  +5 new).
+- Warning gate clean: `-W error::FutureWarning:usrate_handler
+  -W error::DeprecationWarning:usrate_handler` — 14 passed.
+- `py_compile` and a clean `import usrate_handler` from the service folder.
+- `__main__` dry run against the **live** H.15 page and live MySQL: read the
+  watermark `2026-10-05`, scraped 5 dates × 31 columns, hit the nothing-new
+  branch and printed the 30 rates for 2026-10-05 (`Federal_funds 3.88`,
+  `TBond_10_year 5.31`, `Bank_prime_loan 7.00`), returned
+  `{'run_id': …, 'rows': 0}`, wrote no CSV, no table row and no `load_audit`
+  row. The branch that fires in production is therefore the one exercised.
+
+No golden-CSV diff applies: the CSV path is byte-for-byte unchanged, and this
+handler's output is not one of the committed `fin-cron-data` goldens.
+
+### Not done
+
+`serverless deploy function -f usrateHandlerv2` is enough to ship it (no layer
+change — nothing in `finDeepCore`/`finDeepWeb` moved), but the function's
+schedule is still `enabled: false` pending its §11.2 cutover, so there is no
+hurry: the change only affects a path Lambda never takes.
+
+---
+
+## 2026-10-06 — shadow run enabled: a live enable-state table for old vs. new functions
+
+### Goal
+
+Three `fin-deep-data` functions were enabled in AWS (`eodDaily`, `optChainEOD`,
+`statusReport`) and the SNS e-mail subscription was confirmed, starting the
+§11.1 shadow run. Nothing in the repo recorded that: `PLAN-SR-UPSTREAM.md` still
+read "not deployed", `doc/OPERATIONS.md` §10.5 still said all eleven schedules
+were `DISABLED`, and no document anywhere paired an old function with its new
+counterpart and the table they both write. With ten data sets and two writers
+per data set, "which of these two is on?" is the question that decides whether a
+table gets duplicate rows or no rows, and it had no answer in the repo.
+
+Documentation only — no code, configuration or schedule was changed by this
+entry. The enablement itself was done outside the repo, which is the first
+finding below.
+
+### Implementation detail
+
+State was read from AWS rather than from the repo, because the two disagree
+(profile `ServerLessUser`, `us-east-2`):
+
+```bash
+aws scheduler list-schedules   # fin-deep-data (EventBridge Scheduler)
+aws events list-rules          # fin-cron-data (EventBridge rules)
+aws sns list-subscriptions-by-topic --topic-arn <fin-deep-data-dev-status>
+aws lambda get-account-settings --query 'AccountLimit.ConcurrentExecutions'
+aws lambda get-function-configuration --function-name <fn>  # deployed table names
+```
+
+`PLAN-SR-UPSTREAM.md` gains a *Live enable state* section before *Context*: a
+nine-row table of paired data sets (table written · old function + state · new
+function + state · status), a five-row table of old functions with no 3.13
+successor, a schedule-level table for the enabled ones, and the three issues the
+state surfaces. Its `Status:` header is rewritten from "not deployed" to
+"SHADOW RUN LIVE (G1/U5)".
+
+`doc/OPERATIONS.md` §10.5's "all eleven are `DISABLED` as shipped" preamble is
+replaced with the live state plus the three caveats, and points at the plan file
+as authoritative.
+
+Four things the state read turned up that were not in any document:
+
+- **`fin-cron-data`'s `portAssetsHandler` rule is `DISABLED`**, and
+  `portAssetsHandlerv2` is disabled too, so `Trading.portfolio_assets_info` has
+  **no writer at all**. TODOS §5.12 described this gap for `DJI`/`HSI` only, on
+  the assumption the old function was still writing SP500/NDX100 — it is not.
+  Index membership has silently stopped updating for all four indexes.
+- **`optChainEOD`'s 19:40 sweep (`Schedule3`) is `DISABLED`** while its 17:40
+  dispatch and 18:40 sweep are `ENABLED`, against §10.4.1's rule that a
+  function's entries are enabled together. A symbol failing both earlier runs
+  gets no third attempt, so shadow-diff gaps may be an artefact.
+- **`serverless.yml` still reads `enabled: false` for all eleven schedules.**
+  The next `serverless deploy` of `fin-deep-data` reverts the four enabled ones
+  and stops the shadow run with no error — the same class of silent-arming
+  footgun that §10.4.1's "never make `enabled` an `${env:...}` lookup" warning
+  exists to prevent, in the opposite direction.
+- **Account `ConcurrentExecutions` is still 10**, with `optChainEOD` enabled at
+  `OPT_SHARDS=4` and no `reservedConcurrency` — exactly the condition §8.4 and
+  TODOS §2.13 said to resolve *before* enabling that function.
+
+Two smaller discrepancies recorded in the tables rather than fixed:
+`cronHandler` and `optHandler` **hardcode** their target tables
+(`handler.py:146` → `snapshot`, `opt_handler.py:140` → `options_snapshot`)
+instead of reading `TBLSNAPSHOOT`, whose deployed value is `snapshot`; and
+`fffHandler`'s schedule is `ENABLED` although the handler cannot run at all
+(TODOS §4.1), so it has been failing monthly since it was deployed.
+
+### Related files
+
+- `PLAN-SR-UPSTREAM.md` — new *Live enable state* section; `Status:` header
+- `doc/OPERATIONS.md` — §10.5 preamble; changelog
+
+### Test coverage
+
+No tests added or removed: no importable code changed. Verification was the
+state read itself, and every figure in the new tables is traceable to one of
+the five AWS commands above. Table names in the tables are the **deployed**
+Lambda environment values from `get-function-configuration`, not the values in
+the local `Ops/fin-cron-data/.env` — that file has drifted to 24 keys and no
+longer contains `TBLMINUTEPRICE`, `TBLFXSNAPSHOT`, `TBLHISTFX`, `TBLPORTASSETS`
+or `DBTRADING`, all of which are present in the deployed environment. A
+`serverless deploy` of `fin-cron-data` from the working tree as it stands would
+therefore push a smaller environment than the one deployed and break the
+intraday, FX and index handlers with `None` interpolated into SQL — TODOS §3.3's
+failure class, now concrete. Not fixed here; it needs the owner's values.
+
+---
+
 ## 2026-10-02 — statusReport: R2 JSON archive removed, e-mail only
 
 ### Goal

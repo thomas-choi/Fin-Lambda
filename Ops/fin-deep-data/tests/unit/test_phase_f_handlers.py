@@ -117,6 +117,72 @@ def test_usrate_dry_run_writes_csv_and_no_audit(audit, monkeypatch, tmp_path):
     assert len(pd.read_csv(csv)) == 1
 
 
+def test_usrate_localrun_prints_the_new_rates(audit, monkeypatch, tmp_path, capsys):
+    """`localrun: True` puts the rates on stdout, instrument per row."""
+    import usrate_handler as UR
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(UR, "HTML2DataFrame", lambda url: _h15_frame(["2026-09-23", "2026-09-24"]))
+    monkeypatch.setattr(DU, "get_Max_date", lambda tbl, sym=None: date(2026, 9, 22))
+
+    UR.run({"localrun": True, "dbFlag": False}, None)
+
+    out = capsys.readouterr().out
+    assert "US rates -- 2 new row(s) since 2026-09-22" in out
+    assert "Federal_funds" in out and "2026-09-24" in out
+    assert "Instrument" in out                       # transposed, not 30 columns wide
+    for group in UR.GROUP_ROWS:                      # header rows carry no rate
+        assert f"\n{group} " not in out
+
+
+def test_usrate_localrun_prints_latest_when_nothing_is_new(audit, monkeypatch, tmp_path, capsys):
+    """An up-to-date table still prints rates, not just a watermark."""
+    import usrate_handler as UR
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(UR, "HTML2DataFrame", lambda url: _h15_frame(["2026-09-24"]))
+    monkeypatch.setattr(DU, "get_Max_date", lambda tbl, sym=None: date(2026, 9, 24))
+
+    UR.run({"localrun": True, "dbFlag": False}, None)
+
+    out = capsys.readouterr().out
+    assert "no new rows since 2026-09-24" in out and "already stored" in out
+    assert "Federal_funds" in out
+    assert list(tmp_path.glob("USrates_*.csv")) == []    # nothing new, so no CSV
+
+
+def test_usrate_without_localrun_prints_nothing(audit, monkeypatch, capsys):
+    """The Lambda path (localrun absent) must not print the table."""
+    import usrate_handler as UR
+
+    monkeypatch.setattr(UR, "HTML2DataFrame", lambda url: _h15_frame(["2026-09-23", "2026-09-24"]))
+    monkeypatch.setattr(DU, "get_Max_date", lambda tbl, sym=None: date(2026, 9, 22))
+
+    UR.run({}, None)
+
+    assert "US rates --" not in capsys.readouterr().out
+
+
+def test_usrate_format_rates_handles_an_empty_scrape():
+    """Neither stored nor scraped rows: one line, no exception."""
+    import usrate_handler as UR
+
+    empty = pd.DataFrame(columns=["Date", "Federal_funds"])
+    assert "H.15 returned no rows" in UR.format_rates(empty, maxdate="2026-09-24", scraped=empty)
+    assert "H.15 returned no rows" in UR.format_rates(None, maxdate="2026-09-24")
+
+
+def test_usrate_format_rates_does_not_mutate_its_input():
+    """The caller writes the same frame to CSV afterwards."""
+    import usrate_handler as UR
+
+    frame = UR.reshape_rates(_h15_frame(["2026-09-24"]))
+    before = frame.copy()
+    with _no_warning():
+        UR.format_rates(frame, maxdate="2026-09-22", scraped=frame)
+    pd.testing.assert_frame_equal(frame, before)
+
+
 def test_usrate_read_html_accepts_a_literal_table(monkeypatch):
     """StringIO wrapping: a bare HTML string is deprecated in pandas 2.1+."""
     import usrate_handler as UR
@@ -203,6 +269,88 @@ def test_fxeod_failure_is_audited_and_reraised(fx, audit, unset_env):
     with pytest.raises(ValueError):
         fx.run({}, None)
     assert audit["rows"][0]["status"] == "error"
+
+
+# -- the download window (2026-10-06 incident) -----------------------------
+#: 17:10 ET, the scheduled time: past 5PM, so mToday is that same day.
+FX_RUN_AT = pytz.timezone("US/Eastern").localize(datetime(2026, 10, 6, 17, 10))
+
+
+def _capture(frame):
+    """A yf.download stand-in that records its window and returns ``frame``."""
+    calls = []
+
+    def download(ticker, start=None, end=None, **kw):
+        calls.append({"ticker": ticker, "start": start, "end": end})
+        return frame.copy()
+
+    return download, calls
+
+
+def _fx_frame(days, close=7.8):
+    idx = pd.DatetimeIndex(pd.to_datetime(days), name="Date")
+    n = len(days)
+    return pd.DataFrame({"Open": [7.8] * n, "High": [7.9] * n, "Low": [7.7] * n,
+                         "Close": [close] * n if not isinstance(close, list) else close,
+                         "Adj Close": [7.8] * n, "Volume": [0] * n}, index=idx)
+
+
+def test_fxeod_asks_one_day_past_the_end_of_the_window(fx, audit, monkeypatch):
+    """yf.download's end is exclusive: end=mToday returns nothing at all.
+
+    Regression for 2026-10-06, where the watermark was the previous day, the
+    window collapsed to start == end == 2026-10-06, and all 16 tickers came
+    back EMPTY.
+    """
+    monkeypatch.setattr(DU, "get_Max_date", lambda tbl, sym=None: date(2026, 10, 5))
+    download, calls = _capture(_fx_frame(["2026-10-06"]))
+    monkeypatch.setattr(fx.yf, "download", download)
+
+    out = fx.run({"NYTIME": FX_RUN_AT}, None)
+
+    assert [c["start"] for c in calls] == [date(2026, 10, 6)] * 2
+    assert [c["end"] for c in calls] == [date(2026, 10, 7)] * 2   # mToday + 1, not mToday
+    assert out["rows"] == 2                                       # 2 tickers x 2026-10-06
+    assert audit["rows"][0]["date_hi"] == date(2026, 10, 6)
+
+
+def test_fxeod_drops_the_bar_past_the_end_of_the_window(fx, audit, monkeypatch):
+    """Yahoo returns the bar sitting on period2 too; storing it would push the
+    watermark past 2026-10-06 and strand that day's real bar for good."""
+    monkeypatch.setattr(DU, "get_Max_date", lambda tbl, sym=None: date(2026, 10, 5))
+    download, _ = _capture(_fx_frame(["2026-10-06", "2026-10-07"]))
+    monkeypatch.setattr(fx.yf, "download", download)
+
+    fx.run({"NYTIME": FX_RUN_AT}, None)
+
+    [(stored, _db, _tbl)] = audit["stored"]
+    assert list(stored["Date"].dt.date.unique()) == [date(2026, 10, 6)]
+    assert audit["rows"][0]["n_rows"] == 2
+
+
+def test_fxeod_drops_a_forming_bar_with_no_close(fx, audit, monkeypatch):
+    """A day still forming can come back with a NaN Close -- same trap."""
+    monkeypatch.setattr(DU, "get_Max_date", lambda tbl, sym=None: date(2026, 10, 4))
+    download, _ = _capture(_fx_frame(["2026-10-05", "2026-10-06"], close=[7.8, float("nan")]))
+    monkeypatch.setattr(fx.yf, "download", download)
+
+    out = fx.run({"NYTIME": FX_RUN_AT}, None)
+
+    assert out["rows"] == 2                                      # 2026-10-05 only
+    assert audit["rows"][0]["date_hi"] == date(2026, 10, 5)
+
+
+def test_fxeod_skips_the_download_when_the_table_is_current(fx, audit, monkeypatch):
+    """Same-day re-run: the watermark already is mToday, so there is no window."""
+    monkeypatch.setattr(DU, "get_Max_date", lambda tbl, sym=None: date(2026, 10, 6))
+    download, calls = _capture(_fx_frame(["2026-10-06"]))
+    monkeypatch.setattr(fx.yf, "download", download)
+
+    out = fx.run({"NYTIME": FX_RUN_AT}, None)
+
+    assert calls == [] and out["rows"] == 0
+    assert (audit["rows"][0]["status"], audit["rows"][0]["n_rows"]) == ("ok", 0)
+    assert audit["stored"] == []
 
 
 # --------------------------------------------------------------------------
@@ -330,6 +478,136 @@ def test_intraday_failure_is_audited_and_reraised(intraday, audit, monkeypatch):
     with pytest.raises(KeyError):
         intraday.run({"dbFlag": True}, None, market="us")
     assert audit["rows"][0]["status"] == "error"
+
+
+# -- the 60-day intraday limit (2026-10-07 incident) -----------------------
+def test_intraday_clamps_a_watermark_past_the_intraday_limit(intraday, monkeypatch):
+    """Yahoo 422s the whole request when the window starts over 60 days back.
+
+    Regression for 2026-10-07: 0003.HK's watermark was 2025-09-25, so every run
+    asked for a 377-day window, got `YFPricesMissingError`, wrote nothing, and
+    left the watermark where it was -- stalled for good.
+    """
+    M = intraday
+    localnow = pytz.timezone("Asia/Hong_Kong").localize(datetime(2026, 10, 7, 12, 33))
+    stale = datetime(2025, 9, 25, 16, 0)                  # naive exchange-local, as MySQL holds it
+    monkeypatch.setattr(DU, "get_Max_datetime", lambda tbl, s=None: stale)
+
+    out = M.yf_get_max_datetime(localnow, "0003.HK")
+
+    assert out == localnow.replace(tzinfo=None) - timedelta(days=M.MAX_INTRADAY_DAYS)
+    assert (localnow.replace(tzinfo=None) - out).days < 60
+    assert out.tzinfo is None                            # the caller localizes it
+
+
+def test_intraday_keeps_a_watermark_inside_the_limit(intraday, monkeypatch):
+    """A normal watermark is passed through untouched -- no silent gap."""
+    M = intraday
+    localnow = pytz.timezone("Asia/Hong_Kong").localize(datetime(2026, 10, 7, 12, 33))
+    recent = datetime(2026, 10, 6, 16, 0)
+    monkeypatch.setattr(DU, "get_Max_datetime", lambda tbl, s=None: recent)
+
+    assert M.yf_get_max_datetime(localnow, "0001.HK") == recent
+
+
+def test_intraday_empty_table_still_starts_at_the_limit(intraday, monkeypatch):
+    """No rows at all: unchanged behaviour, and the start stays tz-aware."""
+    M = intraday
+    localnow = pytz.timezone("Asia/Hong_Kong").localize(datetime(2026, 10, 7, 12, 33))
+    monkeypatch.setattr(DU, "get_Max_datetime", lambda tbl, s=None: None)
+
+    out = M.yf_get_max_datetime(localnow, "NEW.HK")
+
+    assert out == localnow - timedelta(days=M.MAX_INTRADAY_DAYS) and out.tzinfo is not None
+
+
+def test_intraday_stalled_symbol_downloads_inside_the_limit(intraday, audit, monkeypatch):
+    """End to end: the window reaching yfinance is inside the 60-day limit."""
+    M = intraday
+    now_utc = datetime.now(pytz.utc).replace(second=0, microsecond=0)
+    stale = datetime(2025, 9, 25, 16, 0)
+
+    monkeypatch.setattr(DU, "load_df_SQL", lambda sql: pd.DataFrame({"Symbol": ["0003.HK"]}))
+    monkeypatch.setattr(DU, "load_symbols_dict", lambda: {"0003.HK": "HK"})
+    monkeypatch.setattr(DU, "load_exchange_tz", lambda: {"HK": "Asia/Hong_Kong"})
+    monkeypatch.setattr(DU, "get_Max_datetime", lambda tbl, s=None: stale)
+    windows = []
+    monkeypatch.setattr(M, "yf_download",
+                        lambda s, a, b, InitialRun=False: windows.append((a, b)) or _bars(now_utc))
+
+    out = M.run({"dbFlag": True}, None, market="asia")
+
+    [(start, end)] = windows
+    assert (end - start).days < 60                       # not 377
+    assert out["rows"] == 3 and audit["rows"][0]["status"] == "ok"
+
+
+def test_intraday_localrun_csv_holds_the_frame_that_would_be_stored(intraday, monkeypatch, tmp_path):
+    """30min_<sym>.csv is the table's frame, not yfinance's download.
+
+    The table holds ``Datetime`` tz-naive in exchange-local time next to the UTC
+    instant and the zone name, so that is what a dry run has to show -- it is the
+    only place the localisation can be checked. The CSV used to be written before
+    the reshape, i.e. a UTC-indexed download with none of those columns.
+    """
+    M = intraday
+    now_utc = datetime.now(pytz.utc).replace(second=0, microsecond=0)
+    local_mark = now_utc.astimezone(pytz.timezone("Asia/Hong_Kong")).replace(tzinfo=None) - timedelta(hours=2)
+
+    monkeypatch.setattr(DU, "load_df_SQL", lambda sql: pd.DataFrame({"Symbol": ["0700.HK"]}))
+    monkeypatch.setattr(DU, "load_symbols_dict", lambda: {"0700.HK": "HK"})
+    monkeypatch.setattr(DU, "load_exchange_tz", lambda: {"HK": "Asia/Hong_Kong"})
+    monkeypatch.setattr(DU, "get_Max_datetime", lambda tbl, s=None: local_mark)
+    monkeypatch.setattr(M, "yf_download", lambda s, a, b, InitialRun=False: _bars(now_utc))
+    monkeypatch.chdir(tmp_path)
+
+    M.run({"localrun": True, "dbFlag": False}, None, market="asia")
+
+    csv = pd.read_csv(tmp_path / "30min_0700.HK.csv")
+    assert list(csv.columns) == M.SAVE_COLUMNS
+    assert len(csv) == 3
+    # Both datetime columns are plain `datetime` in MySQL, so neither may carry an
+    # offset here, and Datetime must lead UTCDatetime by Hong Kong's +8.
+    assert "+" not in csv["Datetime"].iloc[0] and "+" not in csv["UTCDatetime"].iloc[0]
+    assert csv["timezone"].unique().tolist() == ["Asia/Hong_Kong"]
+    delta = pd.to_datetime(csv["Datetime"]) - pd.to_datetime(csv["UTCDatetime"])
+    assert delta.unique().tolist() == [pd.Timedelta(hours=8)]
+
+
+def test_intraday_as_stored_strips_the_utc_offset_only_for_the_csv(intraday):
+    """_as_stored() renders the frame as MySQL holds it, leaving the frame alone."""
+    tz = "Asia/Hong_Kong"
+    now_utc = pd.Timestamp("2026-09-25 06:00", tz="UTC")
+    frame = intraday.reshape_bars(_bars(now_utc, n=2), "0700.HK", "HK", tz,
+                                  (now_utc - timedelta(hours=3)).tz_convert(tz),
+                                  (now_utc + timedelta(minutes=1)).tz_convert(tz))
+
+    shown = intraday._as_stored(frame)
+
+    assert shown["UTCDatetime"].dt.tz is None
+    assert str(frame["UTCDatetime"].dt.tz) == "UTC"          # the write path is untouched
+    assert (shown["UTCDatetime"] == frame["UTCDatetime"].dt.tz_localize(None)).all()
+    assert intraday._as_stored(pd.DataFrame(columns=intraday.SAVE_COLUMNS)).empty
+
+
+def test_intraday_localrun_csv_of_an_empty_download_has_the_table_header(intraday, monkeypatch, tmp_path):
+    """A symbol yfinance returns nothing for still gets a CSV, with our columns."""
+    M = intraday
+    now_utc = datetime.now(pytz.utc).replace(second=0, microsecond=0)
+    local_mark = now_utc.astimezone(pytz.timezone("Asia/Hong_Kong")).replace(tzinfo=None) - timedelta(hours=2)
+
+    monkeypatch.setattr(DU, "load_df_SQL", lambda sql: pd.DataFrame({"Symbol": ["0700.HK"]}))
+    monkeypatch.setattr(DU, "load_symbols_dict", lambda: {"0700.HK": "HK"})
+    monkeypatch.setattr(DU, "load_exchange_tz", lambda: {"HK": "Asia/Hong_Kong"})
+    monkeypatch.setattr(DU, "get_Max_datetime", lambda tbl, s=None: local_mark)
+    monkeypatch.setattr(M, "yf_download", lambda s, a, b, InitialRun=False: pd.DataFrame())
+    monkeypatch.chdir(tmp_path)
+
+    out = M.run({"localrun": True, "dbFlag": False}, None, market="asia")
+
+    assert out["rows"] == 0
+    csv = pd.read_csv(tmp_path / "30min_0700.HK.csv")
+    assert list(csv.columns) == M.SAVE_COLUMNS and len(csv) == 0
 
 
 def test_intraday_blacklist_is_read_from_the_packaged_folder(monkeypatch):

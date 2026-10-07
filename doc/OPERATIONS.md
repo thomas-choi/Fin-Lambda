@@ -8,6 +8,13 @@ Running, deploying and debugging Fin-Lambda.
 
 ## Changelog
 
+- 2026-10-08 | Modified | §10.6 the intraday v2 dry-run row: the `30min_*.csv` files now hold the frame that would be stored — `SAVE_COLUMNS`, `Datetime` exchange-local and tz-naive, `UTCDatetime` with no offset — so the exchange-local storage contract is checkable from a dry run; the per-symbol CSV was previously the raw UTC download. Adds the `downloaded DF` / `in window` pair and the expected zone offsets.
+- 2026-10-07 | Added | §8.9 — a `histminprice` watermark older than 60 days made Yahoo reject the whole 15m request, stalling 61 of 803 symbols permanently; a matching §9 row.
+- 2026-10-07 | Modified | §10.6 the intraday v2 dry-run row: the closing `collected / stored` log line, and the stale-watermark warning to expect.
+- 2026-10-06 | Added | §8.8 — `FXHistHandlerv2`'s download window collapsed to zero width whenever the watermark was the previous day, and Yahoo returns no rows for such a request; a matching §9 row.
+- 2026-10-06 | Modified | §7 the `FXHistHandlerv2` 0-row constraint: the cause is the window's `end` being exclusive, and the after-17:00 case was data loss, not expected behaviour. §10.6 the `USD_dailyFX.csv` row no longer calls 0 rows expected — 16 rows, one per ticker, dated the run's own date, is the pass condition.
+- 2026-10-06 | Modified | §10.6 the `usrateHandlerv2` dry-run row: `localrun` now prints the rates to stdout, with both the new-rows and the already-current forms, and an empty print named as the failure signal.
+- 2026-10-06 | Added | §10.5 a live enable-state note: `eodDaily`, `optChainEOD` and `statusReport` enabled against the `*_shadow` tables (shadow run G1/U5 live), SNS subscription confirmed, `fin-cron-data` `portAssetsHandler` found DISABLED with its v2 also disabled, `optChainEOD`'s 19:40 sweep still DISABLED, and the concurrency quota still 10. Authoritative state table lives in `PLAN-SR-UPSTREAM.md`.
 - 2026-10-02 | Deleted | `STATUS_R2_KEY` from the §2 env table and statusReport from the R2 var rows — its R2 JSON upload is removed; §9 troubleshooting row for `r2: null` marked impossible; §10.4 unset-bucket note now concerns optChainEOD only.
 - 2026-10-01 | Added | §10.6 the `max_retries` 5 → 2 measurement: an errored underlying costs ~6 s instead of ~24 s, why `OPT_SHARDS` stays 4 for now, and the empty-chain mode the sweeps do not retry.
 - 2026-10-01 | Added | §8.7 — a `current_symbols_V4` carrying `option` instead of `options` returned an empty symbol list instead of an error; §11.1 step 1 now covers `sql/current_symbols_V5.sql` and the `SYMBOL_PROC_VER=V5` flip.
@@ -289,12 +296,18 @@ corrupts a production table rather than erroring.
 **`pymysql` cannot take a literal `%` in a query string.** `load_df_SQL("… LIKE
 'BRK%'")` raises `ValueError: unsupported format character`; escape it as `%%`.
 
-**`FXHistHandlerv2` writes nothing when the table is current and the clock is
-before 17:00 ET.** Its date rule takes yesterday's date before 17:00, so if
-`FX_histdaily` is already loaded through yesterday the download window is
-`start > end` and yfinance errors per ticker (caught and logged). The run
-finishes `ok` with 0 rows. Inherited unchanged from `fxeod_handler`; it is why
-the function is scheduled at 17:10 ET.
+**`FXHistHandlerv2` writes nothing when the table is already current.** Its date
+rule takes yesterday's date before 17:00 ET, so if `FX_histdaily` is loaded
+through yesterday the window is `start > end`; the handler now logs
+`is current through <date>: nothing to fetch` and skips the download instead of
+sending 16 requests for an inverted window. The run finishes `ok` with 0 rows.
+It is why the function is scheduled at 17:10 ET, past the FX day roll.
+
+Until 2026-10-06 the *same* situation **after** 17:00 ET also produced 0 rows,
+and that was data loss rather than a constraint: the window was
+`[watermark + 1, mToday]` with `end` exclusive, so it had zero width and Yahoo
+returned nothing. Fixed — the window is inclusive of its last date now. See
+§8.8.
 
 **The H.15 page lags the `usrateHandlerv2` schedule by a day.** Measured
 2026-10-01 at 20:50 ET: the page offered 2026-09-24 … 09-30 only, with no row for
@@ -673,6 +686,107 @@ this incident, so recreating V5 from the file cannot reintroduce the typo.
 
 ---
 
+### 8.8 2026-10-06 — an exclusive `end` cost `FX_histdaily` a day
+
+**Symptom.** A `fxeod_handler` dry run collected nothing. All 16 tickers logged
+
+```
+AUD=X: yfinance received OHLC data: EMPTY
+...
+INFO:root:Start_dt = 2026-10-06   ---  end_dt = 2026-10-06
+INFO:root:dry run: wrote 0 row(s) to ./USD_dailyFX.csv
+```
+
+and `GlobalMarketData.FX_histdaily` stood at `2026-10-05`, with no row for
+2026-10-06 although the live 17:10 ET run had already happened.
+
+**Root cause.** `yf.download`'s `end` is exclusive and `fx_run` passed the last
+date it wanted as `end`. With the table loaded through yesterday,
+`start == end == 2026-10-06`: a zero-width window, which Yahoo answers with no
+rows at all. Probed directly, one ticker:
+
+```
+[2026-10-05, 2026-10-05] -> 0 rows        [2026-10-06, 2026-10-07] -> 2 rows
+[2026-10-06, 2026-10-06] -> 0 rows        (so period2's own bar IS returned,
+[2026-10-07, 2026-10-07] -> 0 rows         but only in a non-degenerate range)
+```
+
+The window collapsed this way on every run whose previous day already had a bar
+— in steady state every Tuesday-to-Friday run. Monday runs were safe because
+their watermark is Friday, so the window spans the weekend.
+
+**Why the table still looked healthy.** Yahoo had been answering the degenerate
+request with the in-progress bar often enough to hide it. `first_seen` shows the
+days it did not: 2026-08-28 and 2026-09-18 (both Fridays, written a day late by
+the Saturday run), 2026-08-31 (8 of 16 tickers only), and 2026-10-06 (missing).
+
+**Blast radius.** None moved by the fix: `FXHistHandlerv2` is still `DISABLED`,
+and the live python3.10 `FXHistHandler` is what writes this table. The failure
+mode is a late row, not a wrong one — the next day's window spans two days, so
+the 2026-10-07 run collects 2026-10-06 as well. No back-fill was needed, and the
+same-day rows that did land match Yahoo's final values exactly.
+
+**Fix.** `fetch_exchange_rates` is inclusive of `end_dt`: it asks for
+`end_dt + 1 day` and `_complete_bars` clamps the result back, dropping bars past
+`end_dt` and bars whose `Close` is still NaN. The clamp is required, not tidying
+— once the London FX day has rolled, Yahoo returns the `end_dt + 1` bar too
+(seen at 22:44 ET as a `2026-10-07` row with a NaN `Close`), and storing it
+would both append junk and push the watermark past the real bar, which no later
+run can repair.
+
+**The frozen copy still has it.** `Ops/fin-cron-data/fxeod_handler.py` carries
+the identical window and is the live writer, so expect further one-day-late FX
+rows there until the §11.2 cutover retires it.
+
+---
+
+### 8.9 2026-10-07 — a watermark past the 60-day intraday limit stalls a symbol for good
+
+**Symptom.** An `intraday_min_handler` dry run logged, per old symbol:
+
+```
+Loading 0003.HK minute OHLC from Yahoo 2025-09-25 16:00:00+08:00 to 2026-10-07 12:34:30+08:00!
+response code=422
+YFPricesMissingError('... (Yahoo error = "15m data not available for
+  startTime=1758787200 and endTime=1791347618. The requested range must be
+  within the last 60 days.")')
+0003.HK is downloaded DF : 0 records
+```
+
+**Root cause.** `yf_get_max_datetime` applied the `MAX_INTRADAY_DAYS` floor only
+when the table held **no** row for the symbol; an existing watermark was passed
+to yfinance however old it was. Yahoo serves no 15m bar older than 60 days and
+**rejects the whole request** rather than truncating it, so the download returned
+nothing — and with nothing written the watermark never moved. The next run
+repeated the same impossible request. The stall is permanent: once a symbol falls
+more than 60 days behind, it never recovers on its own.
+
+**Blast radius.** 61 of 803 symbols in `GlobalMarketData.histminprice`, both
+markets (36 US-listed, 14 `.HK`, 4 `.L`, 2 each `.SZ`/`.SS`/`.NS`, 1 `.JK`), the
+oldest stuck since 2025-05-12. The live python3.10 pair has the same logic, so
+the backlog grew there.
+
+**Fix.** The start is clamped forward to `localnow - MAX_INTRADAY_DAYS` with a
+warning naming the gap. The bars between the old watermark and that floor are
+**not recoverable** — Yahoo does not serve them — so each affected symbol keeps a
+one-off hole and resumes from the floor.
+
+**Check the backlog.** This query is the measurement; expect the stalled bucket
+to be empty a few runs after the v2 functions are enabled:
+
+```sql
+SELECT CASE WHEN mx >= NOW() - INTERVAL 60 DAY THEN 'fresh' ELSE 'stalled' END bucket,
+       count(*) symbols, min(mx) oldest
+  FROM (SELECT Symbol, max(Datetime) mx
+          FROM GlobalMarketData.histminprice GROUP BY Symbol) s
+ GROUP BY bucket;
+```
+
+**The frozen copies still have it.** `Ops/fin-cron-data/eoddata_minhandler_us.py`
+and `…_asia.py` are the live writers and keep the defect until the §11.2 cutover.
+
+---
+
 ## 9. Troubleshooting
 
 | Symptom | Likely cause |
@@ -685,6 +799,7 @@ this incident, so recreating V5 from the file cannot reintroduce the typo.
 | `portAssetsHandler` writes nothing, logs `sanity_gate ... outside` | A source page restructured; the gate is working as intended. Check the logged source name |
 | `portAssetsHandler` skips with *"older than the stored max"* | The source's as-of date went backwards. Investigate before using `force` — `force` deliberately does **not** override this guard |
 | `Runtime.MarshalError: ... is not JSON serializable`, after a clean log | The handler returned a non-JSON type (DataFrame, `date`, numpy scalar). The work already completed; only the invocation is marked failed. See §8.1 |
+| `YFPricesMissingError … must be within the last 60 days`, `0 records` for one symbol | Its `histminprice` watermark is over 60 days old. Fixed in `intraday_min_handler` (§8.9), which clamps and warns; in the live python3.10 handlers it stalls that symbol permanently |
 | Serverless config validation error on `python3.13` | `configValidationMode: error` was uncommented; re-comment it |
 | `optChainEOD` reports many more `empty` underlyings than usual | Yahoo is serving no expiries to that IP; it is not an error and the sweeps **do not** retry `empty`. Compare `n_empty` with the previous session. See §10.6 |
 | A "dry run" wrote to the database | `localrun` is not the off-switch — `dbFlag=False` is. See §8.2 |
@@ -697,7 +812,7 @@ this incident, so recreating V5 from the file cannot reintroduce the typo.
 | `Runtime.ImportModuleError` … `you should not try to import numpy from its source directory` | numpy's compiled stack is broken, **not** an import-location problem. On this service it was `strip` corrupting the bundled OpenBLAS (§8.5). The real cause is in the chained `Original error was:` line, which Lambda's log does not show — reproduce locally per §10.3.2 |
 | `OSError: [Errno 30] Read-only file system: './something.csv'` | A handler is writing to the CWD on Lambda (`/var/task`). It must go through `DU.out_dir()` → `/tmp` (§8.6) |
 | `usrateHandlerv2` finishes `ok` with 0 rows | Usually correct: the H.15 page has nothing newer than the stored max. Check the page's dates before investigating (§7) |
-| `FXHistHandlerv2` finishes `ok` with 0 rows | Correct when `FX_histdaily` already holds today — e.g. the live python3.10 `FXHistHandler` ran at 21:10 UTC first (§7) |
+| `FXHistHandlerv2` finishes `ok` with 0 rows | Correct when `FX_histdaily` already holds today — e.g. the live python3.10 `FXHistHandler` ran at 21:10 UTC first; the log then says `is current through <date>: nothing to fetch` (§7). Without that line, and with `Start_dt` equal to `end_dt`, it is the §8.8 zero-width window instead — check that `fetch_exchange_rates` still asks Yahoo for `end_dt + 1` |
 | `CREATE_FAILED: StatusTopic ... "Invalid parameter: Endpoint"` | `STATUS_EMAIL` is empty. Fixed structurally in §8.3; if it recurs, the subscription is back inside the topic's properties |
 | `AWS::Lambda::Function ... "is not updatable with parameters provided"` (`NotUpdatable`) | Almost certainly `reservedConcurrency` against an account quota below 100. Check `aws lambda get-account-settings`; see §8.4 |
 | Deploy fails and every other function says `Resource creation cancelled` | Only the *first* `CREATE_FAILED` matters — the rest are collateral. `aws cloudformation describe-stack-events ... --query 'StackEvents[?ResourceStatus==\`CREATE_FAILED\`]'` |
@@ -1081,8 +1196,32 @@ each enablement a reviewable one-line diff.
 
 ### 10.5 Schedules
 
-All of these are the times each schedule *will* fire once enabled; all eleven
-are `DISABLED` as shipped (§10.4.1).
+All eleven ship `DISABLED` (§10.4.1). **Four are now enabled** — verified against
+AWS 2026-10-06, so the table below is the intended firing time, not the live
+state. The authoritative state table, old function against new function per data
+set, is in `PLAN-SR-UPSTREAM.md` §*Live enable state*.
+
+> **Enabled as of 2026-10-06:** `eodDaily` (18:30 + 19:00 sweep),
+> `optChainEOD` (17:40 dispatch + 18:40 sweep — the **19:40 sweep is still
+> DISABLED**), `statusReport` (20:00). `EOD_WRITE_TBL` and `OPT_WRITE_TBL` point
+> at the `*_shadow` tables, so this is the §11.1 shadow run, not the cutover.
+> The SNS e-mail subscription is confirmed.
+>
+> Three caveats carried by that state:
+> - `serverless.yml` still reads `enabled: false` for all eleven, so the next
+>   `serverless deploy` of this service **reverts the four and silently stops the
+>   shadow run**. Match the file to reality before deploying.
+> - The 19:40 sweep being off removes the third attempt for any symbol that
+>   failed both earlier runs, so shadow-diff gaps may be an artefact of the
+>   half-enablement (§10.4.1 says to enable a function's entries together).
+> - Account `ConcurrentExecutions` is **still 10** (re-checked 2026-10-06) and
+>   `optChainEOD` runs `OPT_SHARDS=4` with no `reservedConcurrency` — the
+>   condition §8.4 / TODOS §2.13 said to fix before enabling it. Throttling is
+>   expected on both services; raise the quota (`L-B99A9384` → 1000).
+>
+> Separately, `fin-cron-data`'s `portAssetsHandler` rule is **DISABLED** and
+> `portAssetsHandlerv2` is also disabled, so `Trading.portfolio_assets_info` has
+> **no writer at all**. See TODOS §5.12.
 
 | Function | Local time | UTC in EDT / EST | Why |
 |---|---|---|---|
@@ -1127,9 +1266,9 @@ What a healthy run looks like (2026-10-01, for comparison on the next run):
 | eodDaily | `load_audit_<asof>.csv` | 17 columns; one row per symbol plus two `'*'` summary rows (bars table and `corp_action_daily`) |
 | optChainEOD | `options_eod_<date>.csv`, `optchain_timing_<date>.csv`, `OptionsChain/<sym>_<date>-PM.csv` | 20 `N_COLUMNS`; the timing CSV gives per-symbol seconds and the summary prints `opt_shards_needed` |
 | portAssetsHandlerv2 | `portfolio_assets_info_{SP500,NDX100,DJI,HSI}.csv` + combined | 503 / 101 / 30 / 85 rows, 719 combined; every `sanity_gate` logged *inside* its band; `action=skip … dbFlag=False` |
-| usrateHandlerv2 | `USrates_<date>.csv` | 31 columns — `Date` plus 30 instrument rates (38 H.15 rows minus 8 group headers); **no file when nothing is newer than the stored max**, which is the normal case intra-day |
-| intraday v2 | `30min_<sym>.csv` per symbol | raw yfinance bars; the log line `reshape_bars: <sym> from … to …` must show exchange-local times |
-| FXHistHandlerv2 | `USD_dailyFX.csv` | `base_cur, target_cur, Open, High, Low, Close, Adj Close, Volume, server_time`. **0 rows is expected** when `FX_histdaily` is already loaded through yesterday and the clock is before 17:00 ET: the handler's own date rule then makes start > end. Not a regression; see §7 |
+| usrateHandlerv2 | `USrates_<date>.csv` | 31 columns — `Date` plus 30 instrument rates (38 H.15 rows minus 8 group headers); **no file when nothing is newer than the stored max**, which is the normal case intra-day. Since 2026-10-06 the run also **prints** the rates to stdout, transposed to one row per instrument: `US rates -- <n> new row(s) since <max>` when there are new rows, or `no new rows since <max>; showing the latest H.15 date, which is already stored` followed by that date's 30 rates. A `localrun` that prints no rate table at all is the failure signal — it means the scrape returned nothing |
+| intraday v2 | `30min_<sym>.csv` per symbol, `30min_<SYMBOLLIST>.csv` pooled | **the frame that would be stored**, not the download: the 11 `SAVE_COLUMNS` in table order, `Datetime` tz-naive in the exchange's own time, `UTCDatetime` beside it with no offset either (both table columns are plain `datetime`), and `timezone` naming the zone. `Datetime - UTCDatetime` must equal that zone's offset on the bar's date — `08:00` for `Asia/Hong_Kong`, `09:00` for `Asia/Seoul`, `-04:00`/`-05:00` for `America/New_York` across the DST boundary — which is the one thing a dry run exists to check. A symbol yfinance returns nothing for still gets a 0-row CSV carrying that header. Before 2026-10-08 the per-symbol CSV held the raw UTC-indexed download instead, with none of the derived columns. `<sym> is downloaded DF : <n>` and `<sym> is in window : <m>` bracket the watermark filter, and `m = n - 1` is normal — the bar sitting exactly on the watermark is excluded by `Datetime > sdatetime`. The log line `reshape_bars: <sym> from … to …` must show exchange-local times. The closing line reports `<n> row(s) collected, <n> stored` — on a dry run `stored` is 0 and `collected` is the signal, because the returned `rows` counts only what reached the table. A `watermark … further back than the 59-day intraday limit` warning is expected for a symbol with a stale watermark and is **not** a failure (§8.9); `0 records` plus a `YFPricesMissingError` is |
+| FXHistHandlerv2 | `USD_dailyFX.csv` | `Date, base_cur, target_cur, Open, High, Low, Close, Adj Close, Volume, server_time`. Run past 17:00 ET with the table loaded through yesterday: **16 rows, one per ticker, all dated the run's own date** — that is the pass condition since 2026-10-06, and 0 rows there is the §8.8 regression. 0 rows *is* expected before 17:00 ET, or on a re-run once the table already holds today; the log then says `is current through <date>: nothing to fetch` (§7) |
 
 A zero-row or all-NaN column, a `sanity_gate … outside` line, or a new stack
 trace is a failure. The eodDaily and optChainEOD outputs are also the inputs to

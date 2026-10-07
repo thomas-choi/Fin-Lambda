@@ -19,7 +19,10 @@ Changed from the original beyond the audit row:
   dt`` -- so an empty table crashed the run instead of back-filling it;
 * a real dry run: ``{"dbFlag": false}`` writes ``USrates_<asof>.csv`` and
   touches neither the table nor ``load_audit``. The original's ``__main__``
-  wrote straight to production.
+  wrote straight to production;
+* ``{"localrun": true}`` also prints the rates to stdout, one row per
+  instrument, so a dry run does not need the CSV opened to be read. When the
+  table is already current it prints the latest H.15 date instead of nothing.
 
 Runs on **python3.13** with the ``finDeepCore`` + ``finDeepWeb`` layers
 (BeautifulSoup + lxml for the scrape; no yfinance).
@@ -112,8 +115,39 @@ def _output_dir(localrun):
     return DU.out_dir(localrun)
 
 
+def format_rates(stored, maxdate=None, scraped=None):
+    """Render a run's rates as a table for stdout. Pure, so it is testable.
+
+    One row per instrument and one column per date -- the H.15 shape, not the
+    stored shape, because 30-odd instrument columns do not fit a terminal.
+
+    When the table is already current ``stored`` is empty, so the latest
+    scraped date is shown instead, labelled as already stored: a ``localrun``
+    should print rates rather than only a watermark.
+    """
+    n = 0 if stored is None else len(stored)
+    if n:
+        body = stored
+        head = f"US rates -- {n} new row(s) since {maxdate}"
+    elif scraped is not None and len(scraped):
+        body = scraped.tail(1)
+        head = (f"US rates -- no new rows since {maxdate}; showing the latest "
+                f"H.15 date, which is already stored")
+    else:
+        return f"US rates -- H.15 returned no rows (stored max {maxdate})"
+
+    shown = body.set_index("Date").transpose()
+    shown.columns = pd.to_datetime(shown.columns).strftime("%Y-%m-%d")
+    shown.index.name = "Instrument"
+    return f"{head}\n{shown.to_string()}"
+
+
 def usrate_run(event, context, dbFlag=True, localrun=False):
-    """Scrape H.15 and append rows newer than the stored max. Returns the rows stored."""
+    """Scrape H.15 and append rows newer than the stored max. Returns the rows stored.
+
+    ``localrun`` prints the rates to stdout (``format_rates``) on top of
+    choosing where a ``dbFlag=False`` CSV lands.
+    """
 
     logging.info(f"** ==> usrate_run(event: {event}, context: {context})")
     ny_time = dt.datetime.now().astimezone( pytz.timezone('US/Eastern'))
@@ -135,6 +169,9 @@ def usrate_run(event, context, dbFlag=True, localrun=False):
     logging.debug(retDF.info())
 
     stDF = retDF[retDF['Date']>maxdate]
+    if localrun:
+        # Before the write, so the rates are on screen even if the write fails.
+        print(format_rates(stDF, maxdate=maxdate, scraped=retDF))
     if len(stDF)>0:
         if dbFlag:
             logging.debug('Loading data to database ')
@@ -163,7 +200,8 @@ def run(event, context):
     """Lambda entry point: usrate_run() plus one load_audit summary row (U10).
 
     Event keys: ``dbFlag`` (False = CSV instead of the table, and no audit row),
-    ``localrun`` (CSV to the CWD rather than /tmp), ``test`` (DEBUG logging).
+    ``localrun`` (print the rates to stdout, and put a CSV in the CWD rather
+    than /tmp), ``test`` (DEBUG logging).
     """
     event = dict(event or {})
     if event.get("test"):
@@ -186,4 +224,4 @@ def run(event, context):
 if __name__ == '__main__':
     # Dry run: reads MySQL for the watermark, writes USrates_<date>.csv, and
     # touches neither USRates nor load_audit.
-    print(run({"localrun": True, "dbFlag": False}, None))
+    print(run({"localrun": True, "dbFlag": True}, None))

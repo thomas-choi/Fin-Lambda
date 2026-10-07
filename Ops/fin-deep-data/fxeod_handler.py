@@ -14,6 +14,8 @@ Changed from the original beyond the audit row:
 
 * ``localrun`` is read from the event instead of a module global that only the
   ``__main__`` block could set, so a dry run works through ``run()`` as well;
+* the download window is inclusive of ``end_dt`` and incomplete bars are
+  dropped (2026-10-06), see ``fetch_exchange_rates``;
 * the watermark fallback is logged. ``FIRSTTRAINDTE`` is also eodDaily's first
   date, and flipping it to 2008/01/01 (plan G3) makes a *new* ticker back-fill
   from 2008 here -- accepted in F6, called out here so it is not a surprise.
@@ -48,13 +50,39 @@ JOB = "FXHistHandler"
 FX_COLUMNS = ['base_cur', 'target_cur', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
 
 
+def _complete_bars(ddf, end_dt):
+    """Drop bars past ``end_dt`` and bars that have no Close yet.
+
+    Two rows have to be kept out of the frame, because either one appends junk
+    *and* pushes the watermark past a real bar, which no later run can repair:
+    Yahoo returns the bar sitting on ``period2`` as well as the ones before it,
+    and a day that is still forming can come back with a NaN Close.
+    """
+    if ddf is None or len(ddf) == 0:
+        return ddf
+    keep = pd.DatetimeIndex(ddf.index).date <= end_dt
+    if 'Close' in ddf.columns:
+        keep = keep & ddf['Close'].notna().to_numpy()
+    return ddf[keep].copy()      # a copy: the caller adds columns to it
+
+
 # Function to fetch the latest exchange rates for multiple tickers
 def fetch_exchange_rates(start_dt, end_dt, tickers, base):
+    """Daily bars per ticker over ``[start_dt, end_dt]`` -- **both inclusive**.
+
+    ``yf.download``'s ``end`` is exclusive, so the call asks for one day past
+    ``end_dt`` and ``_complete_bars`` clamps the result back. Passing ``end_dt``
+    straight through is what emptied the 2026-10-06 run: the watermark was the
+    previous day, so ``start == end``, and Yahoo answers a zero-width range
+    with no rows at all (``doc/OPERATIONS.md`` known incidents).
+    """
     cols = FX_COLUMNS
     data = {}
     for ticker in tickers:
         try:
-            ddf = yf.download(ticker, start=start_dt, end=end_dt, auto_adjust=False, multi_level_index=False)
+            ddf = yf.download(ticker, start=start_dt, end=end_dt + timedelta(days=1),
+                              auto_adjust=False, multi_level_index=False)
+            ddf = _complete_bars(ddf, end_dt)
             if len(ddf)>0:
                 logging.debug(f'Reshape column of {ticker} to {ddf.head(2)}')
                 ddf['base_cur'] = base
@@ -108,7 +136,13 @@ def fx_run(event, context, localrun=False, dbFlag=True):
         Sdate = mktdate + timedelta(days=1)
 
     logging.info(f"Start_dt = {Sdate}   ---  end_dt = {mToday} ")
-    fx_df = fetch_exchange_rates(Sdate, mToday, tickers, base_cur)
+    if pd.Timestamp(Sdate).date() > mToday:
+        # Already loaded through mToday -- a same-day re-run. Asking Yahoo for an
+        # inverted window is 16 pointless requests that all come back empty.
+        logging.info(f'{DBMKTDATA}.{TBLHISTFX} is current through {mktdate}: nothing to fetch')
+        fx_df = pd.DataFrame(columns=FX_COLUMNS)
+    else:
+        fx_df = fetch_exchange_rates(Sdate, mToday, tickers, base_cur)
     fx_df['server_time'] = current_time
 
     logging.debug(fx_df)

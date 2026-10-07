@@ -11,6 +11,9 @@ parses. Those *are* its API.
 
 ## Changelog
 
+- 2026-10-08 | Added | §7.6.1 the `$TBLMINUTEPRICE` column reference — both datetime columns are offset-free, `Datetime` is exchange-local and `timezone` is what disambiguates it, with the `Datetime - UTCDatetime == zone offset` invariant verified on live rows.
+- 2026-10-08 | Modified | §7.1 the intraday `localrun` row: the dry-run CSVs now hold the frame that would be written, not yfinance's raw UTC download.
+- 2026-10-06 | Modified | §1 `usrateHandlerv2`'s `localrun` now also prints the rates to stdout, and the key's independence from `dbFlag` plus the print-before-write ordering are stated. New public function `usrate_handler.format_rates()`.
 - 2026-10-02 | Deleted | §7.7 the `{STATUS_R2_KEY}` row — statusReport no longer writes R2; §7 its return value drops the `r2` key and `localrun` no longer mentions R2.
 - 2026-10-01 | Modified | §4 `load_symbols_db` takes `sym_type` (V5's `@type`) and §7 adds `symbol_proc_type`; §7 the `eodDaily` and `optChainEOD` event contracts gain `symType` and name the procedure their `symbols` default comes from.
 - 2026-10-01 | Added | §7 the `current_symbols_V5` call contract — argument values, which handler sends which, and the result column the caller reads.
@@ -343,11 +346,17 @@ the same JSON-safe list return, with two more entries in it: `DJIA` and `HSI`.
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `dbFlag` | bool | `True` | `False` → `USrates_<date>.csv` instead of the table, and no audit row |
-| `localrun` | bool | `False` | CSV to the CWD instead of `/tmp` |
+| `localrun` | bool | `False` | **Prints the rates to stdout** (one row per instrument, `format_rates`), and puts the CSV in the CWD instead of `/tmp` |
 | `test` | bool | `False` | DEBUG logging |
 
 Returns `{run_id, rows}`. **Changed from `usrate_handler.run`**, which accepted
 `test` only and had no way to suppress a write.
+
+`localrun` is the only key with a stdout effect, and it is independent of
+`dbFlag`: `{"localrun": true, "dbFlag": true}` prints *and* writes. The print
+happens before the write, so the rates are visible even if the write fails.
+When nothing is newer than the stored max — the normal intra-day case — it
+prints the latest H.15 date marked `already stored` rather than nothing.
 
 **`FXHistHandlerv2` — `fxeod_handler.run`**
 
@@ -366,7 +375,7 @@ was a module-global `localrun` only `__main__` could set.
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `localrun` | bool | `False` | per-symbol `30min_<sym>.csv` |
+| `localrun` | bool | `False` | per-symbol `30min_<sym>.csv` plus the pooled `30min_<SYMBOLLIST>.csv`, each holding the frame that would be written to `$TBLMINUTEPRICE` — the 11 columns in table order, `Datetime` tz-naive exchange-local, `UTCDatetime` tz-naive UTC. Since 2026-10-08; the per-symbol file was previously yfinance's raw UTC-indexed download |
 | `dbFlag` | bool | `True` | `False` → no table and no audit row |
 | `InitialRun` | bool | `False` | full available history instead of the watermark (yfinance caps intraday at 60 days) |
 | `test` | int \| bool | — | **new**: int caps the symbol count; truthy sets DEBUG |
@@ -488,6 +497,42 @@ flip, and a defaulted value could silently write to the wrong table. Columns
 match the production tables exactly (`CREATE TABLE … LIKE`): eodDaily writes
 `Date, Symbol, Exchange, Close, Open, High, Low, Volume, AdjClose`, and
 optChainEOD writes the 20 `N_COLUMNS` of the ported job, in that order.
+
+### 7.6.1 `$TBLMINUTEPRICE` (`histminprice`) — the two datetime columns
+
+> **Note:** Schema read off the live table, not from DDL.
+
+Written by `yfus30minEODv2` / `yfasia30minEODv2` (and by the still-live
+`eoddata_minhandler_{us,asia}.py`, which build the identical frame), appended
+with no uniqueness check, in this order:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `Datetime` | `datetime` | bar open **in the exchange's own local time**, tz-naive |
+| `Symbol` | `varchar(45)` | yfinance ticker |
+| `Exchange` | `varchar(45)` | `stock_exchange.csv`, else the ticker's suffix |
+| `Close` `Open` `High` `Low` `Volume` `AdjClose` | `float` | the 15-minute bar |
+| `UTCDatetime` | `datetime` | the same instant in UTC, tz-naive |
+| `timezone` | `varchar(25)` | IANA zone `Datetime` is expressed in, e.g. `Asia/Hong_Kong` |
+
+**Neither datetime column stores an offset**, so `timezone` is the only thing
+that makes `Datetime` unambiguous and a reader must not assume UTC. The
+invariant, verified on live rows 2026-10-08:
+
+```
+Datetime - UTCDatetime == that zone's UTC offset on the bar's own date
+```
+
+e.g. `0001.HK` `2026-10-06 16:00:00` / `08:00:00` / `Asia/Hong_Kong` → `+480`
+minutes; `AAPL` `2026-10-06 15:45:00` / `19:45:00` / `America/New_York` →
+`-240`. The offset is per row, not per symbol — it moves across a DST boundary,
+which is precisely why the zone is stored rather than a fixed shift.
+
+In the handler, `reshape_bars()` leaves `UTCDatetime` tz-aware in the frame while
+`Datetime` is already naive; PyMySQL formats a datetime with `strftime`, so the
+offset is dropped on the way in and the stored value is that UTC wall time. A
+dry-run CSV therefore goes through `_as_stored()`, which strips it, so the file
+shows what a `SELECT` returns.
 
 ### 7.7 R2 key layout
 

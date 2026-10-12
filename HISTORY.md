@@ -7,6 +7,47 @@ Newest first.
 
 ---
 
+## 2026-10-11 — fin-deep-data: stop logging the DB password and full host
+
+### Goal
+`get_DBengine()` must not print credentials. Show only the first/last 4
+characters of `DBPWD` and the first/last 8 of `DBHOST`.
+
+### Root cause
+`get_DBengine()` logged the full `mysql+pymysql://user:password@host…` URL at
+INFO, then the engine repr (password hidden by SQLAlchemy, host in full). It
+surfaced while diagnosing a local run that could not resolve
+`=db-mysql-…`: the local `.env` read `DBHOST==…` (fixed; `.env` is gitignored,
+so no repo change for that part).
+
+### Implementation detail
+- New pure helper `dataUtil.mask_secret(value, keep)` → `first***last`; fully
+  `***` when `len <= 2*keep`; `'<unset>'` for `None`/`''`.
+- `get_DBengine()` logs `user:mask_secret(pwd,4)@mask_secret(host,8):port/db`
+  and drops the `dbconn=>` repr line. The URL passed to `create_engine` is
+  unchanged.
+- `Ops/fin-cron-data/dataUtil.py` is frozen and unchanged; it still logs the
+  password (OPERATIONS §8.10). Rotate the `deepops` password.
+- Deploy impact: `serverless deploy` of fin-deep-data; no layer rebuild.
+
+### Related files
+- `Ops/fin-deep-data/dataUtil.py`
+- `Ops/fin-deep-data/tests/unit/test_dataUtil.py`
+- `doc/API-REFERENCE.md` (§7.2), `doc/OPERATIONS.md` (§8.10, §9)
+
+### Test coverage
+- Added `test_mask_secret` (6 cases: long password, long host, exactly `2*keep`,
+  short, `None`, empty) and `test_get_dbengine_never_logs_password_or_full_host`
+  (asserts neither raw value appears in any log record and the masked forms do).
+- `venv-py313`, from `Ops/fin-deep-data`:
+  `pytest tests/unit -W error::FutureWarning:dataUtil -W error::DeprecationWarning:dataUtil`
+  → 343 passed, 1 skipped (the existing SQLAlchemy-1.4-only control).
+- `py_compile dataUtil.py` clean. Dry run `status_report_handler.py` (read-only,
+  no `STATUS_TOPIC_ARN` locally → no e-mail) completes against production and
+  logs `deepops:abcd***wxyz@db-mysql***cean.com:25060/GlobalMarketData` (real masked characters replaced with placeholders here).
+
+---
+
 ## 2026-10-08 — intraday v2: the dry-run CSV showed the download, not the row
 
 ### Goal

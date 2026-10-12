@@ -531,3 +531,39 @@ def test_on_lambda_flag(monkeypatch):
     assert DU.on_lambda() is False
     monkeypatch.setenv(LAMBDA_VAR, "x")
     assert DU.on_lambda() is True
+
+
+# ==========================================================================
+# Credential masking in the engine log line (2026-10-11).
+# ==========================================================================
+@pytest.mark.parametrize(
+    "value, keep, expected",
+    [
+        ("20_secret_pw_26", 4, "20_s***w_26"),
+        ("db-mysql-sfo3-fund1.example.com", 8, "db-mysql***mple.com"),
+        ("12345678", 4, "***"),          # len == 2*keep: would expose it all
+        ("abc", 4, "***"),
+        (None, 4, "<unset>"),
+        ("", 8, "<unset>"),
+    ],
+)
+def test_mask_secret(value, keep, expected):
+    assert DU.mask_secret(value, keep) == expected
+
+
+def test_get_dbengine_never_logs_password_or_full_host(monkeypatch, caplog):
+    """The 2026-10-11 log printed DBPWD in clear text; it must not any more."""
+    pwd, host = "Sup3r$ecret@Pass", "db-mysql-sfo3-fund1-do-user-0.example.com"
+    monkeypatch.setenv("DBHOST", host)
+    monkeypatch.setenv("DBUSER", "deepops")
+    monkeypatch.setenv("DBPWD", pwd)
+    monkeypatch.setenv("DBPORT", "25060")
+    monkeypatch.setenv("DBMKTDATA", "GlobalMarketData")
+    with caplog.at_level(logging.DEBUG):
+        DU.get_DBengine()   # create_engine does not connect
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert pwd not in logged
+    assert host not in logged
+    assert "Sup3***Pass" in logged
+    assert "db-mysql***mple.com" in logged

@@ -45,6 +45,20 @@ def get_Symbollist(listname):
     s_list = pd.read_csv(listpath)['Symbol'].unique()
     return s_list
 
+def mask_secret(value, keep):
+    """Return ``value`` with only its first and last ``keep`` characters shown.
+
+    For logging credentials and hostnames. A value too short to keep both ends
+    without exposing all of it (``len <= 2 * keep``) is masked completely, and
+    ``None`` or ``''`` comes back as ``'<unset>'`` so a missing env var is visible.
+    """
+    if not value:
+        return '<unset>'
+    value = str(value)
+    if len(value) <= 2 * keep:
+        return '***'
+    return f'{value[:keep]}***{value[-keep:]}'
+
 def get_DBengine():
     global dbconn
     if dbconn is None:
@@ -55,10 +69,11 @@ def get_DBengine():
         DBPORT = environ.get("DBPORT")
 
         dbpath = "mysql+pymysql://{user}:{pw}@{host}:{port}/{db}".format(host=hostname, db=DB, user=uname, pw=pwd,port=DBPORT)
-        logging.info(f'setup DBengine to {dbpath}')
+        # Never log dbpath itself: it carries the password in clear text.
+        logging.info(f'setup DBengine to mysql+pymysql://{uname}:{mask_secret(pwd, 4)}'
+                     f'@{mask_secret(hostname, 8)}:{DBPORT}/{DB}')
         # Create SQLAlchemy engine to connect to MySQL Database
         dbconn = create_engine(dbpath)
-        logging.info(f'dbconn=>{dbconn}')
     return dbconn
 
 def get_Max_datetime(dbntable, symbol=None):

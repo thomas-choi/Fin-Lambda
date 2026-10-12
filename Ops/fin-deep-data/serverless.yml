@@ -256,7 +256,7 @@ functions:
     events:
       # 17:05 ET: H.15 is published at ~16:15 ET on business days.
       - schedule:
-          enabled: false             # cutover: retire usrateHandler first
+          enabled: true             # cutover: retire usrateHandler first
           method: scheduler
           rate: cron(5 17 ? * MON-FRI *)
           timezone: America/New_York
@@ -298,7 +298,7 @@ functions:
       # 20:05 ET Mon-Fri -- the same instants as the old cron(05 00 ? * TUE-SAT)
       # in EDT: 00:05 UTC on Tue-Sat is Mon-Fri evening in New York.
       - schedule:
-          enabled: false             # cutover: retire yfus30minEOD first
+          enabled: true             # cutover: retire yfus30minEOD first
           method: scheduler
           rate: cron(5 20 ? * MON-FRI *)
           timezone: America/New_York
@@ -321,7 +321,7 @@ functions:
       # 06:00 ET = 18:00 HKT (19:00 in EST), after the Asian close, matching
       # the old 10:00 UTC entry in EDT.
       - schedule:
-          enabled: false             # cutover: retire yfasia30minEOD first
+          enabled: true             # cutover: retire yfasia30minEOD first
           method: scheduler
           rate: cron(0 6 ? * MON-FRI *)
           timezone: America/New_York

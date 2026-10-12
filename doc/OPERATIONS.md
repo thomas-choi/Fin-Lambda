@@ -8,6 +8,7 @@ Running, deploying and debugging Fin-Lambda.
 
 ## Changelog
 
+- 2026-10-11 | Added | §8.10 — `get_DBengine()` logged `DBPWD` and the full DB host in clear text (local runs and CloudWatch); it now masks both. A local `DBHOST==…` typo is what surfaced it. Matching §9 row.
 - 2026-10-08 | Modified | §10.6 the intraday v2 dry-run row: the `30min_*.csv` files now hold the frame that would be stored — `SAVE_COLUMNS`, `Datetime` exchange-local and tz-naive, `UTCDatetime` with no offset — so the exchange-local storage contract is checkable from a dry run; the per-symbol CSV was previously the raw UTC download. Adds the `downloaded DF` / `in window` pair and the expected zone offsets.
 - 2026-10-07 | Added | §8.9 — a `histminprice` watermark older than 60 days made Yahoo reject the whole 15m request, stalling 61 of 803 symbols permanently; a matching §9 row.
 - 2026-10-07 | Modified | §10.6 the intraday v2 dry-run row: the closing `collected / stored` log line, and the stale-watermark warning to expect.
@@ -785,6 +786,29 @@ SELECT CASE WHEN mx >= NOW() - INTERVAL 60 DAY THEN 'fresh' ELSE 'stalled' END b
 **The frozen copies still have it.** `Ops/fin-cron-data/eoddata_minhandler_us.py`
 and `…_asia.py` are the live writers and keep the defect until the §11.2 cutover.
 
+### 8.10 2026-10-11 — the engine log line printed the DB password
+
+**Symptom.** A local `status_report_handler.py` run failed every query with
+`Can't connect to MySQL server on '=db-mysql-…' ([Errno -2] Name or service not known)`.
+
+**Root cause.** Two separate things. The connection failure was a typo in the
+local, gitignored `Ops/fin-deep-data/.env`: `DBHOST==db-mysql-…`. dotenv keeps
+everything after the first `=`, so the host began with `=`. The bigger problem
+was in the log itself: `get_DBengine()` logged the whole connection URL, so the
+`DBPWD` value appeared in clear text in the terminal output, and on Lambda in
+CloudWatch on every cold start of all eight functions since 2026-10-01.
+
+**Blast radius.** No data effect. The `deepops` password has been in
+CloudWatch log groups and in at least one pasted terminal log; **rotate it**,
+then update `DBPWD` in `.env` and redeploy (it is a deploy-time env var).
+
+**Fix.** `.env` typo corrected (local only). `dataUtil.get_DBengine()` now logs
+`mask_secret(DBPWD, 4)` and `mask_secret(DBHOST, 8)` — e.g.
+`deepops:abcd***wxyz@db-mysql***cean.com` — and no longer logs the engine
+repr. `Ops/fin-cron-data/dataUtil.py` is frozen and **still logs the password**;
+it stops when those functions are retired (§11.2). Needs a redeploy of
+`fin-deep-data`, not a layer rebuild.
+
 ---
 
 ## 9. Troubleshooting
@@ -806,6 +830,7 @@ and `…_asia.py` are the live writers and keep the defect until the §11.2 cuto
 | `eodDaily` / `optChainEOD` reports `symbol list current_symbols_… returned nothing` | Not an empty market — the stored procedure itself is failing, and `load_df_SQL` swallowed the error. `CALL` it by hand; check the `SymbolMaster` column spellings (`options`, not `option`). See §8.7 |
 | `ValueError: unsupported format character` from a `dataUtil` query | A literal `%` in the SQL (e.g. `LIKE 'x%'`). pymysql's paramstyle is `format`, so `%` must be doubled in a hand-written query |
 | `fin-deep-data` function logs `ModuleNotFoundError: No module named 'pandas'` | `finDeepCore` is not mounted. `finDeepYf` and `finDeepWeb` are de-duplicated against it and are unusable alone |
+| `Can't connect to MySQL server on '=db-…'` / `Name or service not known` | A stray character in `DBHOST` — e.g. `DBHOST==host`. The masked host in the `setup DBengine` line shows it. See §8.10 |
 | `required environment variable X is not set` at startup | `dataUtil.require_env` raising by design, before any SQL is built. Add the key to `Ops/fin-deep-data/.env` |
 | Two sets of rows per session in `histminprice` / `FX_histdaily` / `USRates` | A v2 schedule was enabled while the python3.10 function was still deployed. Disable one; see §11 |
 | `import dataUtil` in a test picks up the wrong service | The two pytest roots were mixed. Run `fin-deep-data` tests from its own folder |

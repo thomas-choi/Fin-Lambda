@@ -11,6 +11,7 @@ parses. Those *are* its API.
 
 ## Changelog
 
+- 2026-10-12 | Modified | §7.2 `get_DBengine()` (fin-deep-data) always connects over TLS; new module constant `DB_CONNECT_ARGS`.
 - 2026-10-11 | Added | §7.2 `mask_secret(value, keep)`, and the note that `get_DBengine()` now logs the password and DB host masked (first/last 4 and 8 characters).
 - 2026-10-08 | Added | §7.6.1 the `$TBLMINUTEPRICE` column reference — both datetime columns are offset-free, `Datetime` is exchange-local and `timezone` is what disambiguates it, with the `Datetime - UTCDatetime == zone offset` invariant verified on live rows.
 - 2026-10-08 | Modified | §7.1 the intraday `localrun` row: the dry-run CSVs now hold the frame that would be written, not yfinance's raw UTC download.
@@ -410,6 +411,7 @@ where noted.
 | `on_lambda()` | `bool` | Whether `AWS_LAMBDA_FUNCTION_NAME` is set |
 | `symbol_proc_type(sym_type)` | `'a'` \| `'o'` | Pure. `None`, `''`, whitespace and anything unrecognised become `'a'`; case and surrounding spaces are ignored. The only value interpolated into the `CALL`, so a bad `symType` cannot reach SQL |
 | `list_dir()` | `str` | `PROD_LIST_DIR`, else this module's directory. **Behaviour change** vs. the `fin-cron-data` copy, which resolves `"."` against the CWD |
+| `get_DBengine()` | `Engine` | As §2, plus: always TLS — `connect_args=DB_CONNECT_ARGS` (`{'ssl': {'check_hostname': False}}`: encrypted, certificate unverified). A server without TLS is now a connection error, not a silent plaintext fallback |
 | `mask_secret(value, keep)` | `str` | Pure. First and last `keep` characters with `***` between; `'***'` when `len(value) <= 2*keep`; `'<unset>'` for `None`/`''`. `get_DBengine()` logs `DBPWD` with `keep=4` and `DBHOST` with `keep=8`, and no longer logs the engine's own repr (it printed the full host) |
 
 ### 7.2.1 `GlobalMarketData.current_symbols_V5` call contract

@@ -8,6 +8,8 @@ Running, deploying and debugging Fin-Lambda.
 
 ## Changelog
 
+- 2026-10-12 | Added | §8.11 — `statusReport` on Lambda failed every query with *"'cryptography' package is required for … caching_sha2_password"* after the `deepops` password rotation; `fin-deep-data` now connects over TLS. Matching §9 row. Redeploy only, no layer rebuild.
+- 2026-10-12 | Added | §8.12 — after the TLS fix, `Access denied (1045)` on Lambda: a `$` in `DBPWD` is expanded away at deploy time; §9 row; never put `$` in a `.env` value.
 - 2026-10-11 | Added | §8.10 — `get_DBengine()` logged `DBPWD` and the full DB host in clear text (local runs and CloudWatch); it now masks both. A local `DBHOST==…` typo is what surfaced it. Matching §9 row.
 - 2026-10-08 | Modified | §10.6 the intraday v2 dry-run row: the `30min_*.csv` files now hold the frame that would be stored — `SAVE_COLUMNS`, `Datetime` exchange-local and tz-naive, `UTCDatetime` with no offset — so the exchange-local storage contract is checkable from a dry run; the per-symbol CSV was previously the raw UTC download. Adds the `downloaded DF` / `in window` pair and the expected zone offsets.
 - 2026-10-07 | Added | §8.9 — a `histminprice` watermark older than 60 days made Yahoo reject the whole 15m request, stalling 61 of 803 symbols permanently; a matching §9 row.
@@ -809,12 +811,73 @@ repr. `Ops/fin-cron-data/dataUtil.py` is frozen and **still logs the password**;
 it stops when those functions are retired (§11.2). Needs a redeploy of
 `fin-deep-data`, not a layer rebuild.
 
+### 8.11 2026-10-12 — a cold auth cache needs `cryptography`, which no layer ships
+
+**Symptom.** `statusReport`, invoked on Lambda at 04:58 UTC, failed every
+`load_df_SQL` with `RuntimeError: 'cryptography' package is required for
+sha256_password or caching_sha2_password auth methods`. The handler swallowed
+each error, as `load_df_SQL` does, and carried on.
+
+**Root cause.** `deepops` authenticates with `caching_sha2_password`. While the
+server holds the password hash in its cache, a fast scramble exchange works
+without any extra package. When the cache is cold (after the password was
+rotated per §8.10, which is most likely here since `.env` changed at
+2026-10-12 01:55 UTC, or after a server restart or maintenance), the client must send the password itself. Over TLS it is sent in
+the encrypted channel. Over a plain connection, which is what `get_DBengine()`
+opened, PyMySQL RSA-encrypts it, and that needs `cryptography`. Neither
+`finDeepCore` nor `venv-py313` has it. The failure is intermittent: a login from
+any client that completes full auth warms the cache, and the Lambda works again
+until the next rotation or restart. A local plain connection succeeded an hour
+later for exactly that reason.
+
+**Blast radius.** Any of the eight functions can hit it after a password change
+or DB restart. A collector that cannot read its watermark or symbol list
+loads nothing (or, in the worst case, re-reads from its default start). No
+corruption was seen; the 04:58 failure was a read-only `statusReport`.
+
+**Fix.** `get_DBengine()` passes `connect_args={'ssl': {'check_hostname': False}}`,
+so every connection is TLS (`TLS_AES_256_GCM_SHA384` against this server) and the
+RSA path is never taken. The certificate is not verified, because the managed DB's
+CA is not in the system store. Packaging that CA and passing `ssl={'ca': …}` would
+add verification. The alternative, adding `cryptography` to `finDeepCore`, was
+rejected: it needs a layer rebuild, while this change needs only a `serverless
+deploy` of `fin-deep-data`. `fin-cron-data` is frozen and unchanged, and it uses
+its own credentials.
+
+### 8.12 2026-10-12 — a `$` in `DBPWD` is deleted at deploy time
+
+**Symptom.** Once the §8.11 fix was deployed, every `statusReport` query failed with
+`(1045, "Access denied for user 'deepops'@'<Lambda IP>' (using password: YES)")`.
+The same `.env` logged in fine locally. The §8.11 error had hidden this: it stopped
+the login before the password was ever checked.
+
+**Root cause.** `serverless deploy` copies `.env` into the Lambda environment, and on
+the way it applies shell-style variable expansion: `$` followed by a letter, digit
+or `_` is read as a variable reference and replaced with nothing. Verified with
+`serverless print` on fake values (Framework 3.35.2, `serverless-dotenv-plugin`
+6.0.0): `'ab$Xyz9!q'` deploys as `ab!q`. Single quotes, double quotes and `\$` all
+fail to protect it. python-dotenv, which `load_dotenv()` uses locally, leaves a
+bare `$NAME` alone, so a local run sees the correct value. On Lambda no `.env` is
+packaged, so `load_dotenv()` finds nothing and the mangled value from the function
+configuration is used. Other specials (`# % ^ & *`) pass through intact.
+
+**Blast radius.** Every `fin-deep-data` function: they all read the same `DBPWD`.
+While diagnosing, a temporary debug line in `get_DBengine()` logged the full DSN,
+password included, to CloudWatch. It was removed the same day, and the password
+was changed.
+
+**Fix.** Choose DB passwords without `$`, and use no `$` in any `.env` value.
+Then redeploy. A new test, `test_get_dbengine_never_logs_the_password`, fails if
+the clear-text password ever reaches the log again.
+
 ---
 
 ## 9. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
+| `'cryptography' package is required for … caching_sha2_password` | A plain (non-TLS) connection hit a cold server auth cache. `fin-deep-data` connects over TLS since 2026-10-12, so check that the deployed `dataUtil.py` is current. See §8.11 |
+| `Access denied for user 'deepops'@'<Lambda IP>'` on Lambda, but a local run with the same `.env` connects | A `$` in `DBPWD` was expanded away by `serverless deploy`. Remove the `$` and redeploy. See §8.12 |
 | SQL contains the literal string `None` | An env var is unset; `environ.get()` returned `None`. Check `.env` against `.env.example` |
 | `Unknown database 'X'` | Schema in `.env` does not exist on this server |
 | error 3750, *"without a primary key"* | `sql_require_primary_key=ON`; create the table manually with a PK |

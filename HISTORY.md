@@ -7,6 +7,97 @@ Newest first.
 
 ---
 
+## 2026-10-12 — fin-deep-data: `$` in DBPWD deleted at deploy; stop logging the password
+
+### Goal
+After the TLS fix (next entry), `statusReport` on Lambda still failed every query, now
+with `(1045, "Access denied for user 'deepops'@'<Lambda IP>' (using password: YES)")`.
+The same `.env` connected fine locally.
+
+### Root cause
+The rotated `DBPWD` contains `$`. `serverless deploy` (Framework 3.35.2 with
+`serverless-dotenv-plugin` 6.0.0) applies shell-style variable expansion to `.env`
+values, deleting every `$NAME` sequence, so the Lambda received a shortened password.
+Quoting and `\$` do not prevent it. Locally, python-dotenv leaves a bare `$NAME`
+alone, which is why local runs worked. Before the TLS fix the `cryptography` error
+stopped the login before the password was checked, so the mismatch was hidden.
+
+### Implementation detail
+- `Ops/fin-deep-data/dataUtil.py`: removed an uncommitted debug `logging.info` in
+  `get_DBengine()` that wrote the full DSN, password included, to CloudWatch. Only
+  the `mask_secret` line remains.
+- Operational fix, owned by the user: change the DB password to one without `$`,
+  update `.env`, and redeploy. The old password reached CloudWatch, so changing it
+  is required anyway.
+
+### Related files
+- `Ops/fin-deep-data/dataUtil.py`, `Ops/fin-deep-data/tests/unit/test_dataUtil.py`
+- `doc/OPERATIONS.md` (§8.12, §9)
+
+### Test coverage
+- Added `test_get_dbengine_never_logs_the_password`. It sets a known `DBPWD`, runs
+  `get_DBengine()` with a stub engine, and asserts that no log record contains it.
+- `tests/unit/test_dataUtil.py`: 72 passed, 1 skipped, with the `dataUtil` warning gate.
+- Reproduced the deploy-time expansion with `serverless print` on fake values in a
+  throwaway service: `'ab$Xyz9!q'` renders as `ab!q`, while `# % ^ & *` survive.
+- Post-deploy check: after the redeploy with the new password, invoke `statusReport`
+  and confirm CloudWatch has no 1045 error.
+
+---
+
+## 2026-10-12 — fin-deep-data: connect to MySQL over TLS
+
+### Goal
+`statusReport` on Lambda failed every query with `RuntimeError: 'cryptography'
+package is required for sha256_password or caching_sha2_password auth methods`.
+Make all eight `fin-deep-data` functions authenticate without `cryptography`.
+
+### Root cause
+`deepops` uses `caching_sha2_password`. When the server's auth cache is cold
+(the password was most likely just rotated per OPERATIONS §8.10, and a DB restart
+has the same effect), the client must send the password itself. On a plain
+connection PyMySQL RSA-encrypts it, and that needs `cryptography`, which is
+absent from `finDeepCore` (and from `venv-py313`). The failure is intermittent:
+a full login from any client warms the cache. A local plain connection succeeded
+afterwards for that reason.
+
+### Implementation detail
+- `Ops/fin-deep-data/dataUtil.py`: new constant `DB_CONNECT_ARGS =
+  {'ssl': {'check_hostname': False}}`, passed as `create_engine(...,
+  connect_args=DB_CONNECT_ARGS)`. Every connection is TLS, which is encrypted
+  but has no certificate verification, because the managed DB's CA is not in
+  the system store. Over TLS the password goes in the encrypted channel, so the
+  RSA path is never taken.
+- Rejected alternative: adding `cryptography` to `finDeepCore`, which needs a
+  layer rebuild, a v3 publish and ARN updates.
+- `fin-cron-data` is frozen, uses a different DB user, and is unchanged.
+- Deploy impact: `serverless deploy` of fin-deep-data. No layer rebuild.
+
+### Related files
+- `Ops/fin-deep-data/dataUtil.py`
+- `Ops/fin-deep-data/tests/unit/test_dataUtil.py`
+- `doc/OPERATIONS.md` (§8.11, §9), `doc/API-REFERENCE.md` (§7.2),
+  `doc/TECHNICAL-DESIGN.md` (§6.6)
+
+### Test coverage
+- Added `test_get_dbengine_connects_over_tls`. It asserts that `create_engine`
+  receives `DB_CONNECT_ARGS`, and that those args really switch PyMySQL's TLS on
+  (`conn.ssl is True`, `ctx.check_hostname is False`), because an empty `ssl`
+  dict would silently leave it off.
+- `venv-py313`, from `Ops/fin-deep-data`: `tests/unit/test_dataUtil.py` → 71
+  passed, 1 skipped. The full suite with the `dataUtil` warning gate → 385
+  passed, 1 skipped, plus 6 failed / 16 errors that are all in the uncommitted
+  work-in-progress `test_news_handler.py` / `test_snapshot_handlers.py`. Their
+  count is identical with this change stashed.
+- `py_compile dataUtil.py` clean. Live checks against production: plain and TLS
+  connections both succeed, and TLS negotiates `TLS_AES_256_GCM_SHA384`. The
+  dry run of `status_report_handler.py` (read-only, and no `STATUS_TOPIC_ARN`
+  locally, so no e-mail) exits 0 with no errors over TLS.
+- Post-deploy check: invoke `statusReport` and confirm there is no
+  `caching_sha2_password` error in CloudWatch.
+
+---
+
 ## 2026-10-11 — fin-deep-data: stop logging the DB password and full host
 
 ### Goal

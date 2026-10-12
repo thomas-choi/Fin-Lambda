@@ -567,3 +567,39 @@ def test_get_dbengine_never_logs_password_or_full_host(monkeypatch, caplog):
     assert host not in logged
     assert "Sup3***Pass" in logged
     assert "db-mysql***mple.com" in logged
+
+
+def test_get_dbengine_connects_over_tls(monkeypatch):
+    """2026-10-12: statusReport failed with "'cryptography' package is required
+    for ... caching_sha2_password" once the server's auth cache was cold. Over TLS
+    PyMySQL never takes the RSA path, so every engine must pass `ssl`."""
+    import pymysql
+
+    for k, v in {"DBHOST": "db.example.com", "DBUSER": "u", "DBPWD": "p",
+                 "DBPORT": "25060", "DBMKTDATA": "GlobalMarketData"}.items():
+        monkeypatch.setenv(k, v)
+    captured = {}
+    monkeypatch.setattr(DU, "create_engine",
+                        lambda url, **kw: captured.update(url=url, **kw) or object())
+    DU.get_DBengine()
+    assert captured["connect_args"] == {"ssl": {"check_hostname": False}}
+
+    # The dict must actually switch PyMySQL's TLS on (an empty dict would not).
+    monkeypatch.setattr(pymysql.connections.Connection, "connect", lambda self, sock=None: None)
+    conn = pymysql.connect(host="h", user="u", password="p", **captured["connect_args"])
+    assert conn.ssl is True
+    assert conn.ctx.check_hostname is False
+
+
+def test_get_dbengine_never_logs_the_password(monkeypatch, caplog):
+    """2026-10-12: a debug line logged the full DSN, password included, to
+    CloudWatch. Only the masked form may reach the log."""
+    secret = "s3cretPassw0rd!"
+    for k, v in {"DBHOST": "db.example.com", "DBUSER": "u", "DBPWD": secret,
+                 "DBPORT": "25060", "DBMKTDATA": "GlobalMarketData"}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(DU, "create_engine", lambda url, **kw: object())
+    with caplog.at_level(logging.DEBUG):
+        DU.get_DBengine()
+    assert caplog.records, "get_DBengine should log the masked DSN"
+    assert not any(secret in r.getMessage() for r in caplog.records)

@@ -59,6 +59,10 @@ def mask_secret(value, keep):
         return '***'
     return f'{value[:keep]}***{value[-keep:]}'
 
+# PyMySQL turns TLS on for any non-empty `ssl` dict; with no `ca` it does not
+# verify the certificate, and check_hostname must then be False.
+DB_CONNECT_ARGS = {'ssl': {'check_hostname': False}}
+
 def get_DBengine():
     global dbconn
     if dbconn is None:
@@ -72,8 +76,13 @@ def get_DBengine():
         # Never log dbpath itself: it carries the password in clear text.
         logging.info(f'setup DBengine to mysql+pymysql://{uname}:{mask_secret(pwd, 4)}'
                      f'@{mask_secret(hostname, 8)}:{DBPORT}/{DB}')
-        # Create SQLAlchemy engine to connect to MySQL Database
-        dbconn = create_engine(dbpath)
+        # Create SQLAlchemy engine to connect to MySQL Database.
+        # Always TLS: when the server's caching_sha2_password cache is cold
+        # (password rotation, DB restart), a plain connection must RSA-encrypt
+        # the password, which needs the `cryptography` package -- not in the
+        # layers. Over TLS the password goes in the encrypted channel instead.
+        # Unverified (CERT_NONE): the managed DB's CA is not in the system store.
+        dbconn = create_engine(dbpath, connect_args=DB_CONNECT_ARGS)
     return dbconn
 
 def get_Max_datetime(dbntable, symbol=None):

@@ -10,6 +10,7 @@ and the tables they write.
 
 ## Changelog
 
+- 2026-10-12 | Modified | §6.6 `get_DBengine()` in the fin-deep-data fork now always connects over TLS (`DB_CONNECT_ARGS`), so a cold `caching_sha2_password` cache no longer needs `cryptography` (`doc/OPERATIONS.md` §8.11).
 - 2026-10-08 | Added | §6.3 decision row — the intraday dry-run CSVs hold the frame that would be stored, via `_as_stored()`, with the write path left alone.
 - 2026-10-07 | Added | §6.3 the intraday watermark is clamped to the 60-day yfinance limit — an older one made Yahoo reject the whole request and stalled that symbol permanently (`doc/OPERATIONS.md` §8.9).
 - 2026-10-06 | Added | §6.3 the FX download window is inclusive of its last date — `fetch_exchange_rates` asks yfinance for `end_dt + 1` and clamps back, because an exclusive `end` made the window zero-width whenever the watermark was the previous day (`doc/OPERATIONS.md` §8.8).
@@ -450,6 +451,7 @@ Differences from the original:
 | `on_lambda()` | `bool` | `AWS_LAMBDA_FUNCTION_NAME` is set |
 | `load_symbols_db(ver="V3", sym_type=None)` | `list` | `CALL GlobalMarketData.current_symbols_{ver}`. `sym_type` is V5's `@type`; it is **withheld** from the versions in `UNTYPED_SYMBOL_PROCS` (`V1`–`V4`), which take no argument, and sent for anything else. That is what lets a handler pass its type unconditionally while `SYMBOL_PROC_VER` still names V4 |
 | `symbol_proc_type(sym_type)` | `'a'` \| `'o'` | Normalises the `@type`. `None`, `''` and anything unrecognised become `'a'`, mirroring the procedure's own defaulting, and the result is the only thing interpolated into the SQL — an event-supplied value never is |
+| `get_DBengine()` | `Engine` | **changed behaviour**: always TLS, via `create_engine(..., connect_args=DB_CONNECT_ARGS)` = `{'ssl': {'check_hostname': False}}` — encrypted, certificate not verified. Without TLS, PyMySQL must RSA-encrypt the password whenever the server's `caching_sha2_password` cache is cold, and that needs `cryptography`, which no layer ships (`doc/OPERATIONS.md` §8.11) |
 | `list_dir()` | `str` | **changed behaviour**: `PROD_LIST_DIR` when set, else this module's own directory. The CSVs are packaged beside `dataUtil.py`, so neither the Lambda nor a local run depends on the CWD. `load_symbols`, `load_symbols_dict`, `load_exchange_tz` and `get_Symbollist` all read through it |
 
 ### 6.7 New tables

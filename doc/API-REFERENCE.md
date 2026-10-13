@@ -11,7 +11,11 @@ parses. Those *are* its API.
 
 ## Changelog
 
+- 2026-10-12 | Modified | §7.1 `FX_snapshot.last_updated` is now each pair's own last bar, not the run's newest bar.
 - 2026-10-12 | Modified | §7.2 `get_DBengine()` (fin-deep-data) always connects over TLS; new module constant `DB_CONNECT_ARGS`.
+- 2026-10-11 | Added | §7.1 event contracts, return values, `load_audit` summary shapes and written columns of the five ports (FXrateHandlerv2, fffHandlerv2, yfNewshandlerv2, optHandlerv2, cronHandlerv2).
+- 2026-10-11 | Added | §7.2 `replace_snapshot`, `r2_client` (moved from optChainEOD), `r2_exists`, `r2_put_json`.
+- 2026-10-11 | Added | §7.7 the news R2 key layout, including the per-worker `PROGRESS/` checkpoint.
 - 2026-10-11 | Added | §7.2 `mask_secret(value, keep)`, and the note that `get_DBengine()` now logs the password and DB host masked (first/last 4 and 8 characters).
 - 2026-10-08 | Added | §7.6.1 the `$TBLMINUTEPRICE` column reference — both datetime columns are offset-free, `Datetime` is exchange-local and `timezone` is what disambiguates it, with the `Datetime - UTCDatetime == zone offset` invariant verified on live rows.
 - 2026-10-08 | Modified | §7.1 the intraday `localrun` row: the dry-run CSVs now hold the frame that would be written, not yfinance's raw UTC download.
@@ -386,6 +390,35 @@ Returns `{run_id, market, job, rows}`. The underlying `run(event, context,
 market="us")` takes the market as a third argument; the two Lambda entry points
 are thin wrappers so one module serves both functions.
 
+**The five 2026-10-11 ports** — all share the service-wide contract: `localrun`
+/ `dbFlag` (`False` → files only, no table, R2 object or `load_audit` row) and
+`test` (any value → DEBUG logging). Each writes one `Symbol='*'` summary row to
+`load_audit` with the **old** job name.
+
+| Function — handler | Extra keys | Dry-run output | `load_audit` summary |
+|---|---|---|---|
+| FXrateHandlerv2 — `fx_snapshot_handler.run` | `NYTIME` (injected clock) | `USD_FX.csv` | job `FXrateHandler`, `status` `empty` when Yahoo returned nothing (the table is then left as it was) |
+| fffHandlerv2 — `fff_handler.run` | — | `famaFrench.csv` (the new months only) | job `fffHandler`, `date_lo`/`date_hi` = first/last new month |
+| yfNewshandlerv2 — `news_handler.run` | `test` as int caps the ticker count; `tickers` (list, overrides the procedure); `quarter_start` (bool or `"True"`, forces fundamentals on/off) | JSON under `./DATA/` in the R2 key layout (§7.7) | job `yfNewshandler`, `table_name` `r2:news`, `n_rows` = new articles, `n_ok`/`n_expected` = tickers done / listed, `partial` on any ticker error or timeout skip |
+| optHandlerv2 — `opt_snapshot_handler.run` | `test` as int caps the contract count; `NYTIME` | `options_list.csv`, `options_snapshot.csv` | job `optHandler`, `n_ok`/`n_expected` = contracts priced / listed, `partial` when some were not found |
+| cronHandlerv2 — `stock_snapshot_handler.run` | `test` as int caps the symbol count; `NYTIME` | `snapshot_yf.csv` | job `cronHandler`, `n_expected` = symbols listed, `partial` when the time guard skipped any |
+
+Return values: FXrateHandlerv2 `{run_id, rows}`; fffHandlerv2 `{run_id, rows,
+date_hi}`; yfNewshandlerv2 `{run_id, date, tickers, done, articles, errors,
+skipped, quarter_start}`; optHandlerv2 `{run_id, rows, contracts}`;
+cronHandlerv2 `{run_id, rows, symbols, skipped}`.
+
+**Written columns** (the tables pre-exist; schemas read off the live server):
+
+> **Note:** Schema inferred from live table, not from DDL
+
+| Table | Columns written | Key | Notes |
+|---|---|---|---|
+| `snapshot` | `Symbol, open, high, low, last, volume, bid, bidvol, ask, askvol, pclose, name, timestamp, quoteType` | `Symbol` | `timestamp` is ET text `%Y/%m/%d-%H:%M:%S`. `quoteType` is new (was always NULL). A row with any of the first 13 missing is not written |
+| `options_snapshot` | `Symbol, PnC, Strike, Expiration, lastPrice, bid, ask, change, percentChange, volume, openInterest, impliedVolatility, inTheMoney, contractSize, currency, PClose, timestamp` | `Symbol, PnC, Strike, Expiration` | `inTheMoney` `'1'`/`'0'`; `PClose` is the underlying's last close, `-0.001` when unavailable; `timestamp` ET text with microseconds; `undPrice` left NULL as before |
+| `FX_snapshot` | `base_cur, target_cur, last_updated, rate, server_time` | `base_cur, target_cur` | `last_updated` UTC, `server_time` ET, both tz-naive. From FXrateHandlerv2 on, `last_updated` is the pair's own last bar, so a pair's rows may carry different times (Asian pairs lag in the evening); `USD/USD` carries the newest |
+| `famaFrench` | `Date, Mkt-RF, SMB, HML, RF` | `Date` | month-end `Date`; values are fractions (`-0.0318` = −3.18 %) |
+
 ### 7.2 Phase A `dataUtil` helpers
 
 In `Ops/fin-deep-data/dataUtil.py` only — the `fin-cron-data` copy does not have
@@ -412,6 +445,10 @@ where noted.
 | `symbol_proc_type(sym_type)` | `'a'` \| `'o'` | Pure. `None`, `''`, whitespace and anything unrecognised become `'a'`; case and surrounding spaces are ignored. The only value interpolated into the `CALL`, so a bad `symType` cannot reach SQL |
 | `list_dir()` | `str` | `PROD_LIST_DIR`, else this module's directory. **Behaviour change** vs. the `fin-cron-data` copy, which resolves `"."` against the CWD |
 | `get_DBengine()` | `Engine` | As §2, plus: always TLS — `connect_args=DB_CONNECT_ARGS` (`{'ssl': {'check_hostname': False}}`: encrypted, certificate unverified). A server without TLS is now a connection error, not a silent plaintext fallback |
+| `replace_snapshot(df, schema, table)` | `int` rows \| `0` \| `None` | `DELETE` + insert in **one transaction**. Empty or `None` frame → `0` and the table is untouched. `schema=None` for sqlite tests |
+| `r2_client()` | boto3 S3 client | **raises** when `R2_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` is unset. Moved here from `optchain_eod_handler` (which now delegates) |
+| `r2_exists(client, bucket, key)` | `bool` | `False` for `404` / `NoSuchKey` / `NotFound`; **raises** on any other error, so a credentials fault is never read as "missing" |
+| `r2_put_json(client, bucket, key, obj)` | `None` | UTF-8 JSON, `default=str` for dates; **raises** on failure |
 | `mask_secret(value, keep)` | `str` | Pure. First and last `keep` characters with `***` between; `'***'` when `len(value) <= 2*keep`; `'<unset>'` for `None`/`''`. `get_DBengine()` logs `DBPWD` with `keep=4` and `DBHOST` with `keep=8`, and no longer logs the engine's own repr (it printed the full host) |
 
 ### 7.2.1 `GlobalMarketData.current_symbols_V5` call contract
@@ -549,7 +586,15 @@ Bucket `UPSTREAM_R2_BUCKET`, credentials `R2_ENDPOINT` / `R2_ACCESS_KEY_ID` /
 bucket unset, optChainEOD logs a warning and still writes its tables — the raw
 archive is best-effort, the database write is not.
 
-`optChainEOD` is the only `fin-deep-data` writer of R2. **Removed 2026-10-02:**
+| `NEWS/yfinance/{YYYY-MM-DD}/{TICKER}/{uuid}.json` | yfNewshandlerv2 | one article: `id, ticker, title, link, publisher, providerPublishTime, full_text, tags`. Date is the UTC run date — an article seen again on a later day is stored again under that day, as the original did |
+| `FINANCIALS/yfinance/{YYYY-MM-DD}/{TICKER}/financials.json` | yfNewshandlerv2, quarter start only | `{income_statement_quarterly, balance_sheet_quarterly, cash_flow_quarterly}`, each `{MM/DD/YYYY: {line item: value}}` |
+| `STATISTICS/yfinance/{YYYY-MM-DD}/{TICKER}/statistics.json` | yfNewshandlerv2, quarter start only | `{ticker, date, Market Cap, Enterprise Value, Trailing P/E, …}` |
+| `PROGRESS/yfinance/{YYYY-MM-DD}/worker-{i}-of-{n}.json` | yfNewshandlerv2 | `{next, total, run_date}` — where worker `i` resumes; written only on a timeout and reset to `next: 0` after a full pass. `n` is in the name, so changing `NEWS_THREADS` starts fresh |
+
+The news keys are in bucket `NEWS_R2_BUCKET` (`fin-modal-data`, the original's
+bucket), same layout as `yf-news-collect.py`.
+
+`optChainEOD` and yfNewshandlerv2 are the only `fin-deep-data` writers of R2. **Removed 2026-10-02:**
 `statusReport`'s `{STATUS_R2_KEY}` JSON (`{asof, generated_at, rows: [...]}`,
 default `status/latest.json`) and the `STATUS_R2_KEY` env var. `load_audit` /
 `v_load_status` is the durable copy of that payload.

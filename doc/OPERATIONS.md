@@ -8,8 +8,12 @@ Running, deploying and debugging Fin-Lambda.
 
 ## Changelog
 
+- 2026-10-12 | Added | §8.13 — FXrateHandlerv2 dropped CNY/INR/IDR/MYR between London midnight and the Asia open (`period="1d"`); now a 5-day window. Provider env `XDG_CACHE_HOME=/tmp/.cache` for yfinance's cache. Changed §10.6 FX healthy shape. Redeploy only.
 - 2026-10-12 | Added | §8.11 — `statusReport` on Lambda failed every query with *"'cryptography' package is required for … caching_sha2_password"* after the `deepops` password rotation; `fin-deep-data` now connects over TLS. Matching §9 row. Redeploy only, no layer rebuild.
 - 2026-10-12 | Added | §8.12 — after the TLS fix, `Access denied (1045)` on Lambda: a `$` in `DBPWD` is expanded away at deploy time; §9 row; never put `$` in a `.env` value.
+- 2026-10-11 | Added | §10.2 env rows `TBLSNAPSHOT` `TBLOPTSNAPSHOT` `TBLFXSNAPSHOT` `TBLFFF` `SNAP_SYMBOL_PROC_VER` `SNAP_THREADS` `NEWS_R2_BUCKET` `NEWS_THREADS`; `FX_TICKERS` and the R2 credentials gain their new readers. No layer rebuild: `bs4` is already in `finDeepYf`, `requests` in `finDeepCore`, `boto3` in the runtime (checked with the §10.3.2 import test).
+- 2026-10-11 | Added | §10.5 schedule rows and §10.6 dry-run commands and healthy shapes for FXrateHandlerv2, fffHandlerv2, yfNewshandlerv2, optHandlerv2, cronHandlerv2.
+- 2026-10-11 | Added | §8.11 — cronHandler timing out, FXrateHandler's rule disabled since 2026-10-07, fffHandler and yfNewshandler failing every run; two §9 rows for the v2 snapshot handlers.
 - 2026-10-11 | Added | §8.10 — `get_DBengine()` logged `DBPWD` and the full DB host in clear text (local runs and CloudWatch); it now masks both. A local `DBHOST==…` typo is what surfaced it. Matching §9 row.
 - 2026-10-08 | Modified | §10.6 the intraday v2 dry-run row: the `30min_*.csv` files now hold the frame that would be stored — `SAVE_COLUMNS`, `Datetime` exchange-local and tz-naive, `UTCDatetime` with no offset — so the exchange-local storage contract is checkable from a dry run; the per-symbol CSV was previously the raw UTC download. Adds the `downloaded DF` / `in window` pair and the expected zone offsets.
 - 2026-10-07 | Added | §8.9 — a `histminprice` watermark older than 60 days made Yahoo reject the whole 15m request, stalling 61 of 803 symbols permanently; a matching §9 row.
@@ -870,7 +874,42 @@ was changed.
 Then redeploy. A new test, `test_get_dbengine_never_logs_the_password`, fails if
 the clear-text password ever reaches the log again.
 
+### 8.11 2026-10-11 — four of the five unported python3.10 functions were not doing their job
+
+Found while planning the TODOS §5.10 port, from CloudWatch metrics for
+2026-10-04 … 10-11 and the live tables:
+
+| Function | What was wrong | Since | Blast radius |
+|---|---|---|---|
+| `cronHandler` | average 517 s, maximum **900 s (the timeout)**, on a 10-minute schedule: two sequential Yahoo calls per symbol for ~800 symbols | as long as the list has been this size | runs overlap; a run that times out writes nothing, so the snapshot skips refreshes |
+| `FXrateHandler` | its EventBridge rule is **DISABLED** — 24 invocations a day until 2026-10-07 02:00 UTC, none since | 2026-10-07 | `FX_snapshot` frozen at 2026-10-06 22:00 ET. `FXHistHandler`, whose v2 successor is the one marked `enabled: true` in the repo, is still ENABLED — the two may have been confused when retiring old rules |
+| `fffHandler` | `Runtime.ImportModuleError: No module named 'getFamaFrenchFactors'` on every run; also the TODOS §4.1 `NameError`s behind it | at least 2023-11 | `famaFrench` stops at 2023-10-31 |
+| `yfNewshandler` | fails every run in ~2 ms: `CSV file not found: stock_list_global.csv` (`DEFAULT_TICKERS` names a file that exists nowhere) and `LOCALRUN=True` is deployed | as deployed | no news collected; each failure is retried twice by Lambda's async retry, so 72 failed invocations a day |
+
+**Fix.** All four are covered by the 2026-10-11 ports (§10.2, §10.5, §10.6),
+which ship disabled. Nothing in `fin-cron-data` was changed. The `fin-cron-data`
+CloudWatch logs also print that service's DB password in clear text on every
+cold start (its frozen `dataUtil`, cf. §8.10) — rotate it.
+
 ---
+
+### 8.13 2026-10-12 — FX snapshot lost the Asian pairs every evening; yfinance cache read-only
+
+**Symptom.** A manual invoke of `FXrateHandlerv2` at 19:50 ET logged `4 Failed downloads:
+['IDR=X', 'MYR=X', 'INR=X', 'CNY=X'] … possibly delisted (period=1d)` and replaced
+`FX_snapshot` with 13 of 17 rows. Separately, every yfinance handler logged `Failed to create
+TzCache … Read-only file system: '/home/sbx_user1051'`.
+
+**Root cause.** `period="1d"` is Yahoo's current FX day, which starts at London midnight
+(23:00 UTC in BST). Pairs quoted only in Asian hours have no bar in it until Asia opens.
+yfinance's cache lives under `$HOME/.cache`, which is read-only on Lambda.
+
+**Blast radius.** Those four currencies were missing from the snapshot for about 2 hours each
+weekday evening and all of Sunday evening. The cache only cost extra timezone lookups.
+
+**Fix.** `FX_PERIOD = "5d"`, and `last_updated` is per pair (its own last bar), so a stale
+quote shows its real age. `serverless.yml` provider `environment: XDG_CACHE_HOME: /tmp/.cache`.
+Redeploy only, no layer rebuild.
 
 ## 9. Troubleshooting
 
@@ -893,6 +932,8 @@ the clear-text password ever reaches the log again.
 | `eodDaily` / `optChainEOD` reports `symbol list current_symbols_… returned nothing` | Not an empty market — the stored procedure itself is failing, and `load_df_SQL` swallowed the error. `CALL` it by hand; check the `SymbolMaster` column spellings (`options`, not `option`). See §8.7 |
 | `ValueError: unsupported format character` from a `dataUtil` query | A literal `%` in the SQL (e.g. `LIKE 'x%'`). pymysql's paramstyle is `format`, so `%` must be doubled in a hand-written query |
 | `fin-deep-data` function logs `ModuleNotFoundError: No module named 'pandas'` | `finDeepCore` is not mounted. `finDeepYf` and `finDeepWeb` are de-duplicated against it and are unusable alone |
+| A snapshot table (`snapshot`, `options_snapshot`, `FX_snapshot`) did not refresh, with a `replace_snapshot … empty frame, previous snapshot kept` warning | The v2 snapshot run fetched nothing — Yahoo down or the symbol procedure empty. By design the old snapshot is kept rather than emptied; the `load_audit` row says `empty` |
+| `cronHandlerv2` `load_audit` row `partial`, log `time guard: <n> symbol(s) skipped` | the run reached 60 s before its 540 s timeout. Yahoo is slower than the measured ~85 s — check for rate limiting before raising `SNAP_THREADS`, which does not help against a rate cap |
 | `Can't connect to MySQL server on '=db-…'` / `Name or service not known` | A stray character in `DBHOST` — e.g. `DBHOST==host`. The masked host in the `setup DBengine` line shows it. See §8.10 |
 | `required environment variable X is not set` at startup | `dataUtil.require_env` raising by design, before any SQL is built. Add the key to `Ops/fin-deep-data/.env` |
 | Two sets of rows per session in `histminprice` / `FX_histdaily` / `USRates` | A v2 schedule was enabled while the python3.10 function was still deployed. Disable one; see §11 |
@@ -988,11 +1029,16 @@ addition.
 | `OPT_SHARDS` | optChainEOD dispatcher | `ceil(T_total / 540 s)` from the timing run, §10.6 |
 | `OPT_MAX_PARALLEL` | `serverless.yml` | `4` → `reservedConcurrency` on optChainEOD. **Currently unread**: the line is commented out because the account quota forbids reserving (§8.4) |
 | `FIRSTTRAINDTE` | eodDaily, FXHistHandlerv2 | first date for a symbol with no rows, and FX's empty-table fallback. `2008/01/01` only after the F6 audit (§11.3) |
-| `FX_TICKERS` | FXHistHandlerv2 | Python list literal, `ast.literal_eval` |
+| `FX_TICKERS` | FXHistHandlerv2, FXrateHandlerv2 | Python list literal, `ast.literal_eval`. FXrateHandlerv2 reads it through `require_env` and raises when it is unset or not a list |
+| `TBLSNAPSHOT` `TBLOPTSNAPSHOT` `TBLFXSNAPSHOT` `TBLFFF` | cronHandlerv2, optHandlerv2, FXrateHandlerv2, fffHandlerv2 | **required, no fallback** — `snapshot`, `options_snapshot`, `FX_snapshot`, `famaFrench`. The old handlers hardcoded the first two; `fin-cron-data`'s `.env` carries `TBLSNAPSHOOT="snapshoot"`, a typo nothing ever read — do not copy it |
+| `SNAP_SYMBOL_PROC_VER` | cronHandlerv2 | **required** — `V3`, the procedure `load_symbols("system")` calls, so the snapshot keeps its membership |
+| `SNAP_THREADS` | cronHandlerv2 | `8`. Yahoo caps the request rate at ~8–10/s, so more threads do not shorten the run |
+| `NEWS_R2_BUCKET` | yfNewshandlerv2 | **required** — `fin-modal-data`, the bucket the old `yfNewshandler` was configured for |
+| `NEWS_THREADS` | yfNewshandlerv2 | `8` worker threads, one disjoint sub-list each |
 | `SYMBOLLIST` | intraday v2 | one list name, or unset to loop over four |
 | `PROD_LIST_DIR` | `dataUtil.list_dir()` | **leave empty** — then the packaged folder is used, which is right on Lambda and locally |
 | `TBLDLYPRICE` `TBLOPTCHAIN` `TBLUSRATES` `TBLHISTFX` `TBLMINUTEPRICE` `TBLPORTASSETS` | statusReport (inferred lines) and the v2 handlers | `histdailyprice7`, `OptionChains`, `USRates`, `FX_histdaily`, `histminprice`, `portfolio_assets_info` |
-| `R2_ENDPOINT` `R2_ACCESS_KEY_ID` `R2_SECRET_ACCESS_KEY` | optChainEOD | reused from `yf-news-collect`. **statusReport no longer reads any R2 var** (2026-10-02) |
+| `R2_ENDPOINT` `R2_ACCESS_KEY_ID` `R2_SECRET_ACCESS_KEY` | optChainEOD, yfNewshandlerv2 (`dataUtil.r2_client`) | reused from `yf-news-collect`. **statusReport no longer reads any R2 var** (2026-10-02) |
 | `UPSTREAM_R2_BUCKET` | optChainEOD | unset → raw chains are **not** archived (logged as a warning, the run still succeeds) |
 | `OPT_RAW_PREFIX` | optChainEOD | `raw/optchain`. `STATUS_R2_KEY` was removed on 2026-10-02 with statusReport's R2 upload — delete it from `.env` if an old copy still carries it |
 | `STATUS_EMAIL` | `serverless.yml` resources | **must be set before the first deploy** — an empty `Endpoint` makes the SNS subscription fail in CloudFormation |
@@ -1319,6 +1365,18 @@ set, is in `PLAN-SR-UPSTREAM.md` §*Live enable state*.
 | optChainEOD (sweeps) | 18:40, 19:40 | — | dispatch + 60 and + 120 min |
 | statusReport | 20:00 Mon–Fri | 00:00 / 01:00 | after the sweeps |
 | the five v2 functions | see §10.2 table | — | additionally blocked until their cutover: the old function must be retired first (§11.2) |
+| FXrateHandlerv2 | every hour, every day | — | the old `cron(0 0-23 ? * SUN-SAT *)` |
+| fffHandlerv2 | 12:00 on the 5th and 20th | 16:00 / 17:00 | Ken French publishes with an irregular lag; the run is idempotent |
+| yfNewshandlerv2 | :01 every hour, every day | — | the old `cron(1 * * * ? *)` |
+| optHandlerv2 | every 10 min 09:00–17:50 Mon–Fri | 13:00–21:50 / 14:00–22:50 | the old UTC rule also ran 08:00–08:50 EDT, before the open |
+| cronHandlerv2 | every 10 min 09:00–20:50 Mon–Fri | 13:00–00:50 / 14:00–01:50 | the old `0/10 13-21` + `0/10 21-00` UTC in EDT. **Timeout 540 s**, under the interval, so runs cannot overlap |
+
+The five 2026-10-11 ports also ship `enabled: false` and write tables their
+`fin-cron-data` originals write. For three of them there is no live writer to
+collide with — `FXrateHandler`'s rule is DISABLED and `fffHandler` /
+`yfNewshandler` fail every run (§8.11) — so they can be enabled as soon as a
+manual invoke passes. `optHandlerv2` and `cronHandlerv2` need §11.2: disable the
+old rule first.
 
 All are EventBridge Scheduler entries with an explicit `timezone`, so unlike
 `fin-cron-data`'s UTC cron expressions they do not drift an hour at a DST
@@ -1339,6 +1397,11 @@ cd Ops/fin-deep-data                                   # flat imports
 ../../venv-py313/bin/python fxeod_handler.py
 ../../venv-py313/bin/python intraday_min_handler.py        # US
 ../../venv-py313/bin/python intraday_min_handler.py asia
+../../venv-py313/bin/python fx_snapshot_handler.py     # USD_FX.csv
+../../venv-py313/bin/python fff_handler.py             # famaFrench.csv (new months only)
+../../venv-py313/bin/python opt_snapshot_handler.py    # options_list.csv, options_snapshot.csv
+../../venv-py313/bin/python stock_snapshot_handler.py  # snapshot_yf.csv, full V3 list, ~90 s
+../../venv-py313/bin/python news_handler.py            # ./DATA/NEWS/... for six fixed tickers
 ```
 
 Each `__main__` supplies a dry-run event; all of them read MySQL (symbol lists
@@ -1357,6 +1420,12 @@ What a healthy run looks like (2026-10-01, for comparison on the next run):
 | usrateHandlerv2 | `USrates_<date>.csv` | 31 columns — `Date` plus 30 instrument rates (38 H.15 rows minus 8 group headers); **no file when nothing is newer than the stored max**, which is the normal case intra-day. Since 2026-10-06 the run also **prints** the rates to stdout, transposed to one row per instrument: `US rates -- <n> new row(s) since <max>` when there are new rows, or `no new rows since <max>; showing the latest H.15 date, which is already stored` followed by that date's 30 rates. A `localrun` that prints no rate table at all is the failure signal — it means the scrape returned nothing |
 | intraday v2 | `30min_<sym>.csv` per symbol, `30min_<SYMBOLLIST>.csv` pooled | **the frame that would be stored**, not the download: the 11 `SAVE_COLUMNS` in table order, `Datetime` tz-naive in the exchange's own time, `UTCDatetime` beside it with no offset either (both table columns are plain `datetime`), and `timezone` naming the zone. `Datetime - UTCDatetime` must equal that zone's offset on the bar's date — `08:00` for `Asia/Hong_Kong`, `09:00` for `Asia/Seoul`, `-04:00`/`-05:00` for `America/New_York` across the DST boundary — which is the one thing a dry run exists to check. A symbol yfinance returns nothing for still gets a 0-row CSV carrying that header. Before 2026-10-08 the per-symbol CSV held the raw UTC-indexed download instead, with none of the derived columns. `<sym> is downloaded DF : <n>` and `<sym> is in window : <m>` bracket the watermark filter, and `m = n - 1` is normal — the bar sitting exactly on the watermark is excluded by `Datetime > sdatetime`. The log line `reshape_bars: <sym> from … to …` must show exchange-local times. The closing line reports `<n> row(s) collected, <n> stored` — on a dry run `stored` is 0 and `collected` is the signal, because the returned `rows` counts only what reached the table. A `watermark … further back than the 59-day intraday limit` warning is expected for a symbol with a stale watermark and is **not** a failure (§8.9); `0 records` plus a `YFPricesMissingError` is |
 | FXHistHandlerv2 | `USD_dailyFX.csv` | `Date, base_cur, target_cur, Open, High, Low, Close, Adj Close, Volume, server_time`. Run past 17:00 ET with the table loaded through yesterday: **16 rows, one per ticker, all dated the run's own date** — that is the pass condition since 2026-10-06, and 0 rows there is the §8.8 regression. 0 rows *is* expected before 17:00 ET, or on a re-run once the table already holds today; the log then says `is current through <date>: nothing to fetch` (§7) |
+
+| FXrateHandlerv2 | `USD_FX.csv` | `base_cur, target_cur, last_updated, rate, server_time`; one row per `FX_TICKERS` currency with any 5m bar in the last 5 days, plus `USD/USD = 1.0`. 2026-10-12 19:55 ET: **17 of 17**, with CNY/INR/IDR at 22:35 UTC and MYR at 18:10 UTC (their last quote) while the rest are at 23:50–23:55 (§8.13). Before that fix, 15 of 17 was normal on a Sunday evening. `last_updated` is per pair, UTC; `server_time` ET |
+| fffHandlerv2 | `famaFrench.csv` | `Date, Mkt-RF, SMB, HML, RF`, month-end dates, fractions. 2026-10-11: **34 rows, 2023-11-30 … 2026-08-31** (the table stops at 2023-10-31). 0 rows is correct once the table is current |
+| optHandlerv2 | `options_list.csv`, `options_snapshot.csv` | 2026-10-11: 73 contracts on 38 underlyings → **71 priced**, the same 71 keys as the live `options_snapshot`; 2 logged `not found` (strikes Yahoo no longer lists). **23 s** against the old 111 s. 17 columns, `undPrice` absent as before |
+| cronHandlerv2 | `snapshot_yf.csv` | 14 columns, no all-NaN column. 2026-10-11: **856 symbols → 851 quotes → 795 rows in 88 s**; every one of the live table's 787 symbols present plus 8 the old run lost, `pclose` agreeing with the live table (median relative difference 0). A handful of `info failed: HTTP Error 404` lines for delisted symbols is normal |
+| yfNewshandlerv2 | `DATA/NEWS/yfinance/<date>/<TICKER>/<uuid>.json` | 2026-10-11: AAPL/MSFT/NVDA/SPY/XOM → 241 articles in 34 s, `0700.HK` → 0 (Yahoo's search has no news for most Asian listings — that is the source, not a failure). **Run it twice**: the second run must report `0 new article(s)` in about a second, which is the existence check skipping stored articles before any page fetch |
 
 A zero-row or all-NaN column, a `sanity_gate … outside` line, or a new stack
 trace is a failure. The eodDaily and optChainEOD outputs are also the inputs to

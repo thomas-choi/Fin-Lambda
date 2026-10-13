@@ -7,6 +7,47 @@ Newest first.
 
 ---
 
+## 2026-10-12 — FXrateHandlerv2: Asian pairs dropped every evening; yfinance cache on Lambda
+
+### Goal
+A manual invoke at 19:50 ET logged `4 Failed downloads: ['IDR=X', 'MYR=X', 'INR=X',
+'CNY=X'] … possibly delisted (period=1d)` and wrote 13 of 17 rows to `FX_snapshot`. Every
+yfinance handler also logged `Failed to create TzCache … Read-only file system:
+'/home/sbx_user1051'`.
+
+### Root cause
+- `yf.download(period="1d")` returns Yahoo's current FX "day", which starts at London
+  midnight (23:00 UTC in summer). CNY/INR/IDR/MYR are quoted only in Asian hours, so
+  between 23:00 UTC and the Asia open they have no bar in that day. Verified at 23:54 UTC:
+  `1d` had none for CNY/INR/IDR; `5d` had each at 22:35 UTC. Because the snapshot is
+  replaced wholesale, those currencies vanished from `FX_snapshot` for about two hours
+  each evening (all of Sunday evening). The old `fx_handler.py` had the same window and wrote NULLs.
+- yfinance puts its tz/cookie cache under platformdirs' `user_cache_dir()` (`$HOME/.cache`),
+  which is read-only on Lambda, so the cache was off and each run re-fetched every ticker's timezone.
+
+### Implementation detail
+- `Ops/fin-deep-data/fx_snapshot_handler.py`: new `FX_PERIOD = "5d"` used by `fetch_close`;
+  `latest_rates` takes each ticker's last non-NaN Close and stamps `last_updated` with
+  **that ticker's own** last bar (UTC, tz-naive). Before, it stamped the frame's last bar, which
+  with a 5-day window would have made a stale rate look fresh. The `USD/USD` row takes the newest bar.
+- `Ops/fin-deep-data/serverless.yml`: provider `environment: XDG_CACHE_HOME: /tmp/.cache`,
+  so every yfinance handler in the service gets a writable cache. Redeploy only, no layer rebuild.
+
+### Related files
+`Ops/fin-deep-data/fx_snapshot_handler.py`, `Ops/fin-deep-data/serverless.yml`,
+`Ops/fin-deep-data/tests/unit/test_snapshot_handlers.py`, `doc/OPERATIONS.md`,
+`doc/TECHNICAL-DESIGN.md`, `doc/API-REFERENCE.md`, `doc/PRODUCT-GUIDE.md`.
+
+### Test coverage
+- Modified `test_fx_latest_rates_ffill_base_row_and_dropped_nan`: `last_updated` is now
+  per pair (EUR 18:05, HKD/USD 18:10).
+- Added `test_fx_latest_rates_keeps_pair_quiet_since_london_midnight` (regression: the 2026-10-12
+  23:50 UTC shape; CNY kept at its 22:35 bar).
+- `venv-py313`: 419 passed, 1 skipped (pre-existing), with `-W error::FutureWarning`/`DeprecationWarning`
+  scoped to `fx_snapshot_handler`.
+- Dry run `{"localrun": True, "dbFlag": False}` at 19:55 ET: **17 of 17** rows (was 13), CNY/INR/IDR
+  `last_updated` 22:35 UTC, MYR 18:10 UTC. `serverless print` renders `XDG_CACHE_HOME`.
+
 ## 2026-10-12 — fin-deep-data: `$` in DBPWD deleted at deploy; stop logging the password
 
 ### Goal
@@ -95,6 +136,99 @@ afterwards for that reason.
   locally, so no e-mail) exits 0 with no errors over TLS.
 - Post-deploy check: invoke `statusReport` and confirm there is no
   `caching_sha2_password` error in CloudWatch.
+## 2026-10-11 — the last five python3.10 functions ported to fin-deep-data (TODOS §5.10)
+
+### Goal
+Give every remaining `fin-cron-data` function a python3.13 successor, so the
+service no longer depends on the `python3.10` runtime for anything:
+`cronHandler`, `optHandler`, `FXrateHandler`, `fffHandler`, `yfNewshandler`.
+Owner decisions: port all five, fixing the two broken ones on the way; the stock
+snapshot uses a thread pool; news reads `current_symbols_V5('a')` split across a
+pool of worker threads; the target DB is `fin-deep-data`'s own `.env`.
+
+### Root cause (of what the survey found — `doc/OPERATIONS.md` §8.11)
+Four of the five were not doing their job, per CloudWatch 2026-10-04 … 10-11:
+`cronHandler` averaged 517 s and hit its 900 s timeout on a 10-minute schedule
+(two sequential Yahoo calls per symbol); `FXrateHandler`'s rule has been DISABLED
+since 2026-10-07, so `FX_snapshot` is frozen at 2026-10-06 22:00 ET;
+`fffHandler` fails at import (`getFamaFrenchFactors` is in no layer) and
+`famaFrench` stops at 2023-10-31; `yfNewshandler` fails every run because
+`DEFAULT_TICKERS=stock_list_global.csv` does not exist.
+
+### Implementation detail
+New modules in `Ops/fin-deep-data`, one per function, each on the service-wide
+contract (`localrun` / `dbFlag` / `test`, output through `DU.out_dir`, one
+`load_audit` summary row under the **old** job name, an `error` row before
+re-raising, a `__main__` with `dbFlag: False`):
+
+- **`fx_snapshot_handler.py`** (FXrateHandlerv2) — same 5-minute download and
+  forward-fill; a currency with no bar today is left out instead of written NULL.
+- **`fff_handler.py`** (fffHandlerv2) — downloads Ken French's zip with
+  `requests`, parses the monthly block (`parse_ff3`: `YYYYMM` → month-end, % →
+  fraction, rounded to 6 dp), appends months after the stored max with
+  `append_ignore`. Stored months are not rewritten, although Ken French has
+  revised them slightly (2023-10 `Mkt-RF` −3.18 % stored, −3.15 % today).
+- **`news_handler.py`** (yfNewshandlerv2, no hyphen so it imports) — V5 `'a'`
+  list split into `NEWS_THREADS` disjoint `shard_symbols` sub-lists, one worker
+  thread and one `requests.Session` each; the R2 existence check runs before the
+  article-page fetch; a per-worker `PROGRESS/…/worker-{i}-of-{n}.json`
+  checkpoint resumes a pass cut short by the timeout. Same R2 key layout and
+  bucket (`fin-modal-data`).
+- **`opt_snapshot_handler.py`** (optHandlerv2) — same two `Trading.sp_*`
+  procedures and output columns; one `option_chain` per (Symbol, Expiration) and
+  one `history` per Symbol; a failed procedure now raises instead of reading as
+  "no trades".
+- **`stock_snapshot_handler.py`** (cronHandlerv2) — one `Ticker.info` per symbol
+  on `SNAP_THREADS` threads; `info` already carries the session OHLCV, so the
+  per-symbol `history` call is gone. A batched `yf.download` was tried first and
+  measured slower (110–155 s at 4, 8 or 16 threads — Yahoo caps the request
+  rate, not the parallelism). Fills `quoteType`. Timeout 540 s, under the
+  interval. The dead DDS TCP path (`stk_run`) is not ported.
+
+`dataUtil.py`: `replace_snapshot()` (DELETE + insert in one transaction, no-op on
+an empty frame — the three snapshot ports use it), and `r2_client()` moved from
+`optchain_eod_handler` (which now delegates) plus `r2_exists()` / `r2_put_json()`.
+
+`serverless.yml`: five functions, per-function runtime, layers (`fff` core only;
+the rest core + yf) and package allowlist, every schedule `enabled: false`.
+`.env` / `.env.example`: `TBLSNAPSHOT` `TBLOPTSNAPSHOT` `TBLFXSNAPSHOT` `TBLFFF`
+`SNAP_SYMBOL_PROC_VER` `SNAP_THREADS` `NEWS_R2_BUCKET` `NEWS_THREADS`.
+**No layer rebuild** — `bs4` ships in `finDeepYf`, `requests` in `finDeepCore`,
+`boto3` in the runtime. Nothing in `Ops/fin-cron-data` changed. **Not deployed.**
+
+### Related files
+- `Ops/fin-deep-data/{fx_snapshot,fff,news,opt_snapshot,stock_snapshot}_handler.py` (new)
+- `Ops/fin-deep-data/dataUtil.py`, `optchain_eod_handler.py`, `serverless.yml`, `.env.example`
+- `Ops/fin-deep-data/tests/unit/test_snapshot_handlers.py`, `test_fff_handler.py`,
+  `test_news_handler.py` (new), `tests/unit/test_dataUtil.py`, `tests/conftest.py`,
+  `tests/fixtures/ff3_factors_sample.csv` (new, trimmed real file)
+- `doc/TECHNICAL-DESIGN.md`, `doc/OPERATIONS.md`, `doc/API-REFERENCE.md`,
+  `doc/PRODUCT-GUIDE.md`, `CLAUDE.md`, `TODOS.md`, `PLAN-SR-UPSTREAM.md`
+
+### Test coverage
+- **Added** 73 tests (343 → 416 passed, 1 skipped) in `venv-py313` with
+  `-W error::FutureWarning:<m> -W error::DeprecationWarning:<m>` for all five new
+  modules, `dataUtil` and `optchain_eod_handler`:
+  `test_dataUtil.py` +10 (`replace_snapshot` swap / empty-frame keep / rollback
+  on a failed insert; `r2_exists` code mapping and re-raise; `r2_put_json`;
+  `r2_client` env), `test_snapshot_handlers.py` 30, `test_fff_handler.py` 11,
+  `test_news_handler.py` 22. Every handler: `dbFlag=False` writes nothing,
+  error path audited, each new required env var absent → raises before any
+  query or download.
+- `py_compile` and `python -W error -c "import <m>"` clean for all seven modules.
+- **Dry runs against live sources, writes off** (shapes in OPERATIONS §10.6),
+  diffed against the live tables because no golden CSV is committed:
+  `options_snapshot` 71/71 identical keys (23 s vs 111 s); `snapshot` 795 rows
+  ⊇ all 787 live symbols, `pclose` median difference 0, 88 s vs 517 s;
+  `FX_snapshot` 15 of 17 (INR/IDR had no Sunday bars); `famaFrench` 34 new
+  months 2023-11 … 2026-08; news 241 articles for five tickers, and a second run
+  0 new in 0.4 s (existence check).
+- `serverless package`: five new `AWS::Scheduler::Schedule`, all `DISABLED`;
+  each zip holds only `dataUtil.py` and its module.
+- Layer import test (OPERATIONS §10.3.2) on the build trees: core + yf resolves
+  `bs4` 4.12.3 and `yfinance` 0.2.58; core alone resolves `requests`.
+- **Not yet run:** deploy, manual invoke with `dbFlag: True`, and the
+  per-data-set flip (OPERATIONS §11.2).
 
 ---
 

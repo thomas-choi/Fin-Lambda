@@ -13,7 +13,14 @@ OptionsChain/
 USD_dailyFX.csv
 USrates_*.csv
 portfolio_assets_info*.csv
+famaFrench.csv
+options_snapshot.csv
+snapshot_yf.csv
+USD_FX.csv
+options_list.csv
 
 # Serverless / npm
 .serverless/
 node_modules/
+
+DATA/

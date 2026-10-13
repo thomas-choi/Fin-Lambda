@@ -230,16 +230,9 @@ def _output_dir(localrun):
 
 
 def r2_client():
-    """boto3 S3 client for R2 -- the endpoint_url pattern from yf-news-collect.py."""
-    import boto3
-
-    return boto3.client(
-        "s3",
-        endpoint_url=DU.require_env("R2_ENDPOINT"),
-        aws_access_key_id=DU.require_env("R2_ACCESS_KEY_ID"),
-        aws_secret_access_key=DU.require_env("R2_SECRET_ACCESS_KEY"),
-        region_name="auto",
-    )
+    """boto3 S3 client for R2. Moved to ``dataUtil.r2_client`` (2026-10-11) so the
+    news collector shares it; kept here as the name the tests patch."""
+    return DU.r2_client()
 
 
 def put_raw(client, bucket, key, frame):

@@ -603,3 +603,91 @@ def test_get_dbengine_never_logs_the_password(monkeypatch, caplog):
         DU.get_DBengine()
     assert caplog.records, "get_DBengine should log the masked DSN"
     assert not any(secret in r.getMessage() for r in caplog.records)
+
+
+# ==========================================================================
+# Snapshot replace + R2 helpers (2026-10-11, the five-function port).
+# ==========================================================================
+@pytest.fixture
+def snap_table(sqlite_engine):
+    with sqlite_engine.begin() as conn:
+        conn.execute(text("CREATE TABLE snap (Symbol TEXT PRIMARY KEY, last REAL)"))
+        conn.execute(text("INSERT INTO snap VALUES ('OLD', 1.0)"))
+    return sqlite_engine
+
+
+def _snap(rows):
+    return pd.DataFrame(rows, columns=["Symbol", "last"])
+
+
+def test_replace_snapshot_swaps_contents(snap_table):
+    assert DU.replace_snapshot(_snap([("A", 2.0), ("B", 3.0)]), None, "snap") == 2
+    with snap_table.connect() as conn:
+        assert sorted(r[0] for r in conn.execute(text("SELECT Symbol FROM snap"))) == ["A", "B"]
+
+
+def test_replace_snapshot_empty_frame_keeps_previous(snap_table):
+    """The old DELETE-then-StoreEOD emptied the table when a fetch came back empty."""
+    assert DU.replace_snapshot(_snap([]), None, "snap") == 0
+    assert DU.replace_snapshot(None, None, "snap") == 0
+    assert _count(snap_table, "snap") == 1
+
+
+def test_replace_snapshot_rolls_back_the_delete_on_insert_failure(snap_table):
+    """A failed insert must not leave the table empty: one transaction."""
+    bad = _snap([("A", 2.0), ("A", 3.0)])          # duplicate PK -> insert fails
+    assert DU.replace_snapshot(bad, None, "snap") is None
+    with snap_table.connect() as conn:
+        assert conn.execute(text("SELECT Symbol FROM snap")).scalar() == "OLD"
+
+
+class _ClientError(Exception):
+    def __init__(self, code):
+        self.response = {"Error": {"Code": code}}
+
+
+class _FakeR2:
+    def __init__(self, keys=(), fail_code=None):
+        self.keys, self.fail_code, self.puts = set(keys), fail_code, {}
+
+    def head_object(self, Bucket, Key):
+        if self.fail_code:
+            raise _ClientError(self.fail_code)
+        if Key not in self.keys:
+            raise _ClientError("404")
+        return {}
+
+    def put_object(self, Bucket, Key, Body, ContentType):
+        self.puts[Key] = Body
+
+
+@pytest.mark.parametrize("code", ["404", "NoSuchKey", "NotFound"])
+def test_r2_exists_maps_missing_codes_to_false(code):
+    client = _FakeR2()
+    client.head_object = lambda Bucket, Key: (_ for _ in ()).throw(_ClientError(code))
+    assert DU.r2_exists(client, "b", "k") is False
+
+
+def test_r2_exists_true_for_present_key():
+    assert DU.r2_exists(_FakeR2(keys={"k"}), "b", "k") is True
+
+
+def test_r2_exists_raises_on_other_errors():
+    """AccessDenied must not read as "missing" -- that would re-upload everything."""
+    with pytest.raises(_ClientError):
+        DU.r2_exists(_FakeR2(fail_code="AccessDenied"), "b", "k")
+
+
+def test_r2_put_json_writes_utf8_json():
+    import json
+
+    client = _FakeR2()
+    DU.r2_put_json(client, "b", "k.json", {"t": "café", "d": date(2026, 10, 9)})
+    assert json.loads(client.puts["k.json"].decode("utf-8")) == {"t": "café", "d": "2026-10-09"}
+
+
+def test_r2_client_requires_its_env(monkeypatch):
+    for k in ("R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(RuntimeError, match="R2_ENDPOINT"):
+        DU.r2_client()

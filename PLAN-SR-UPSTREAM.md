@@ -67,16 +67,21 @@ at all.
 
 ### Unpaired — old functions with no 3.13 successor yet
 
-These are what TODOS §5.10 still has to port before `python3.10` is blocked
-from redeploy.
+**Ported 2026-10-11** (TODOS §5.10): each now has a `fin-deep-data` successor —
+`cronHandlerv2`, `optHandlerv2`, `FXrateHandlerv2`, `fffHandlerv2`,
+`yfNewshandlerv2` — written and tested, schedules **disabled**, **not yet deployed**. The *Old state*
+column below was re-read from AWS on 2026-10-11; `FXrateHandler`'s rule has
+been DISABLED since 2026-10-07, and `fffHandler` / `yfNewshandler` fail every
+run (`doc/OPERATIONS.md` §8.11), so those three have no live writer to collide
+with at cutover.
 
 | Data set | Table written | Old function | Old state | Note |
 |---|---|---|---|---|
 | Stock/ETF snapshot | `GlobalMarketData.snapshot` (delete-then-append) | `cronHandler` 0/10 at 13-21 + 21-00 | ENABLED | Table name is **hardcoded** in `handler.py:146`, not read from `TBLSNAPSHOOT` |
 | Options snapshot | `GlobalMarketData.options_snapshot` (delete-then-append) | `optHandler` 0/10 at 12-21 | ENABLED | Table name hardcoded in `opt_handler.py:140` |
-| FX spot snapshot | `GlobalMarketData.FX_snapshot` (delete-then-append) | `FXrateHandler` hourly | ENABLED | `TBLFXSNAPSHOT` |
+| FX spot snapshot | `GlobalMarketData.FX_snapshot` (delete-then-append) | `FXrateHandler` hourly | **DISABLED since 2026-10-07** | `TBLFXSNAPSHOT`. No writer since — the table is stale |
 | Fama-French 3-factor | `GlobalMarketData.famaFrench` | `fffHandler` monthly, 1st | ENABLED | ⚠️ Schedule is enabled but the handler **cannot run** — `NameError` on every invocation (TODOS §4.1) |
-| News | S3 / Cloudflare R2 | `yfNewshandler` hourly | ENABLED | No DB table |
+| News | S3 / Cloudflare R2 | `yfNewshandler` hourly | ENABLED | No DB table. ⚠️ Fails every run: `DEFAULT_TICKERS` names a missing CSV |
 
 ### Schedule-level detail for the three enabled new functions
 

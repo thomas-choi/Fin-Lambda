@@ -77,6 +77,12 @@ provider:
   region: us-east-2
   profile: ServerLessUser
   timeout: 900     # default is 6 sec
+  environment:
+    # yfinance keeps its timezone/cookie cache under platformdirs'
+    # user_cache_dir(), i.e. $HOME/.cache -- read-only on Lambda, so every
+    # yfinance handler logged "Failed to create TzCache" and re-fetched each
+    # ticker's timezone on every run (2026-10-12). /tmp is the writable path.
+    XDG_CACHE_HOME: /tmp/.cache
   iam:
     role:
       statements:
@@ -275,7 +281,7 @@ functions:
     events:
       # 17:10 ET, matching the old 21:10 UTC entry in EDT.
       - schedule:
-          enabled: true             # cutover: retire FXHistHandler first
+          enabled: false             # cutover: retire FXHistHandler first
           method: scheduler
           rate: cron(10 17 ? * MON-FRI *)
           timezone: America/New_York
@@ -324,6 +330,116 @@ functions:
           enabled: true             # cutover: retire yfasia30minEOD first
           method: scheduler
           rate: cron(0 6 ? * MON-FRI *)
+          timezone: America/New_York
+
+  # ---------------------------------------------------------------------------
+  # The last five python3.10 functions, ported 2026-10-11 (TODOS 5.10). Each
+  # SHIPS DISABLED. Each writes what its fin-cron-data original writes, so the
+  # cutover rule above applies: disable the old EventBridge rule first
+  # (doc/OPERATIONS.md 11.2). FXrateHandler's and the two broken ones' (fff,
+  # news) old rules write nothing today, so those three are safe first.
+  # ---------------------------------------------------------------------------
+  FXrateHandlerv2:
+      # Hourly FX spot snapshot -> TBLFXSNAPSHOT (one-transaction replace).
+    handler: fx_snapshot_handler.run
+    runtime: python3.13
+    timeout: 120
+    package:
+      patterns:
+        - dataUtil.py
+        - fx_snapshot_handler.py
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    events:
+      # Every hour, every day -- the old cron(0 0-23 ? * SUN-SAT *).
+      - schedule:
+          enabled: true             # cutover: old FXrateHandler rule is already DISABLED
+          method: scheduler
+          rate: cron(0 * * * ? *)
+          timezone: America/New_York
+
+  fffHandlerv2:
+      # Monthly Fama-French 3 factors -> TBLFFF, from Ken French's data library.
+    handler: fff_handler.run
+    runtime: python3.13
+    timeout: 120
+    package:
+      patterns:
+        - dataUtil.py
+        - fff_handler.py
+    layers:
+      - ${self:custom.coreLayer}     # requests + pandas only; no yfinance
+    events:
+      # 12:00 ET on the 5th and 20th: the file is published with an irregular
+      # lag and the run is idempotent (max-Date filter + INSERT IGNORE).
+      - schedule:
+          enabled: true             # cutover: old fffHandler has failed every run
+          method: scheduler
+          rate: cron(0 12 5,20 * ? *)
+          timezone: America/New_York
+
+  yfNewshandlerv2:
+      # Yahoo news (+ quarterly fundamentals) for the V5 'a' list -> R2 JSON.
+    handler: news_handler.run
+    runtime: python3.13
+    package:
+      patterns:
+        - dataUtil.py
+        - news_handler.py
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}       # yfinance + beautifulsoup4; boto3 is in the runtime
+    events:
+      # :01 past every hour, every day -- the old cron(1 * * * ? *).
+      - schedule:
+          enabled: false            # cutover: old yfNewshandler has failed every run
+          method: scheduler
+          rate: cron(1 * * * ? *)
+          timezone: America/New_York
+
+  optHandlerv2:
+      # 10-minute snapshot of the traded option contracts -> TBLOPTSNAPSHOT.
+    handler: opt_snapshot_handler.run
+    runtime: python3.13
+    timeout: 300
+    package:
+      patterns:
+        - dataUtil.py
+        - opt_snapshot_handler.py
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    events:
+      # 09:00-17:50 ET Mon-Fri. The old cron(0/10 12-21) UTC also ran 08:00-08:50
+      # EDT, before the open, and shifted an hour with DST.
+      - schedule:
+          enabled: true             # cutover: retire optHandler first
+          method: scheduler
+          rate: cron(0/10 9-17 ? * MON-FRI *)
+          timezone: America/New_York
+
+  cronHandlerv2:
+      # 10-minute stock/ETF snapshot -> TBLSNAPSHOT (one Ticker.info per symbol
+      # on SNAP_THREADS threads; ~85 s for the V3 list, against 517 s before).
+    handler: stock_snapshot_handler.run
+    runtime: python3.13
+    # Under the 10-minute interval, so two runs can never overlap; the handler
+    # stops starting symbols 60 s before it.
+    timeout: 540
+    package:
+      patterns:
+        - dataUtil.py
+        - stock_snapshot_handler.py
+    layers:
+      - ${self:custom.coreLayer}
+      - ${self:custom.yfLayer}
+    events:
+      # 09:00-20:50 ET Mon-Fri -- the old cron(0/10 13-21 + 21-00) UTC in EDT.
+      - schedule:
+          enabled: true             # cutover: retire cronHandler first
+          method: scheduler
+          rate: cron(0/10 9-20 ? * MON-FRI *)
           timezone: America/New_York
 
 resources:

@@ -118,6 +118,15 @@ FAKE_ENV = {
     "EOD_BATCH": "200",
     "OPT_SHARDS": "3",
     "OPT_RAW_PREFIX": "raw/optchain",
+    # The five 2026-10-11 ports (snapshots, FFF, news)
+    "TBLSNAPSHOT": "snapshot",
+    "TBLOPTSNAPSHOT": "options_snapshot",
+    "TBLFFF": "famaFrench",
+    "SNAP_SYMBOL_PROC_VER": "V3",
+    "SNAP_THREADS": "4",
+    "NEWS_R2_BUCKET": "test-news-bucket",
+    "NEWS_THREADS": "3",
+    "FX_TICKERS": "['EUR=X', 'HKD=X', 'JPY=X']",
     # Lists
     "PROD_LIST_DIR": str(HANDLER_DIR),
     "SYMBOLLIST": "system",

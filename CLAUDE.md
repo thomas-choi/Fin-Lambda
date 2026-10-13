@@ -45,7 +45,9 @@ Despite the `30min` naming, both `eoddata_minhandler_*.py` download `interval='1
 
 ## Deployed functions (`Ops/fin-deep-data/serverless.yml`)
 
-Eight python3.13 functions, added 2026-10-01 (PLAN-SR-UPSTREAM A–F). Schedules
+Thirteen python3.13 functions: eight added 2026-10-01 (PLAN-SR-UPSTREAM A–F),
+and on 2026-10-11 the five remaining python3.10 functions ported (TODOS §5.10)
+— no `fin-cron-data` function is now without a successor. Schedules
 are **EventBridge Scheduler** entries in `America/New_York`, not UTC cron.
 
 **Every schedule in this service ships `enabled: false`** — a deploy creates the
@@ -63,8 +65,13 @@ own (`doc/OPERATIONS.md` §10.4.1). The times below are when a schedule fires
 | FXHistHandlerv2 | `fxeod_handler.run` | 17:10 | FX daily EOD → `$TBLHISTFX` |
 | yfus30minEODv2 | `intraday_min_handler.run_us` | 20:05 | US 15-min bars → `$TBLMINUTEPRICE` |
 | yfasia30minEODv2 | `intraday_min_handler.run_asia` | 06:00 | Asia 15-min bars, same table |
+| FXrateHandlerv2 | `fx_snapshot_handler.run` | hourly | FX spot → `$TBLFXSNAPSHOT` |
+| fffHandlerv2 | `fff_handler.run` | 12:00 on the 5th, 20th | Ken French zip → `$TBLFFF` (replaces the never-working `getFamaFrenchFactors` path) |
+| yfNewshandlerv2 | `news_handler.run` | :01 hourly | V5 `'a'` list on `NEWS_THREADS` threads → R2 `$NEWS_R2_BUCKET` |
+| optHandlerv2 | `opt_snapshot_handler.run` | 0/10 09-17 Mon-Fri | traded contracts → `$TBLOPTSNAPSHOT` |
+| cronHandlerv2 | `stock_snapshot_handler.run` | 0/10 09-20 Mon-Fri | one `Ticker.info` per V3 symbol on `SNAP_THREADS` threads → `$TBLSNAPSHOT`; timeout 540 s |
 
-**The last five carry a second condition.** Each writes a table its still-live
+**The last ten carry a second condition.** Each writes a table its still-live
 `fin-cron-data` counterpart writes, so enabling one before the old function is
 retired duplicates rows or stores a spurious membership change. Cut each data set
 over on its own: `doc/OPERATIONS.md` §11.2.
@@ -101,7 +108,7 @@ These conventions repeat across every handler; follow them rather than introduci
 
 **Errors are swallowed, not raised.** Nearly every `dataUtil` function wraps its body in `try/except` + `logging.error(..., exc_info=True)` and implicitly returns `None`. Callers rarely check. If you make a function raise, audit its callers first.
 
-**Snapshot tables are delete-then-append, not upsert.** `handler.py`, `opt_handler.py`, and `fx_handler.py` all run `DU.ExecSQL(f"DELETE FROM {DB}.{TBL} where (Symbol != '1');")` then `StoreEOD(...)`; the table holds only the newest snapshot. Historical tables (`TBLMINUTEPRICE`, `TBLHISTFX`) instead append after querying `get_Max_datetime()` / `get_Max_date()` for a watermark.
+**Snapshot tables are delete-then-append, not upsert.** `handler.py`, `opt_handler.py`, and `fx_handler.py` all run `DU.ExecSQL(f"DELETE FROM {DB}.{TBL} where (Symbol != '1');")` then `StoreEOD(...)`; the table holds only the newest snapshot. Their `fin-deep-data` ports use `DU.replace_snapshot()` instead — the same replace in **one transaction**, and a no-op on an empty frame. Historical tables (`TBLMINUTEPRICE`, `TBLHISTFX`) instead append after querying `get_Max_datetime()` / `get_Max_date()` for a watermark.
 
 **Symbol lists come from two interchangeable sources.** `DU.load_symbols(name)` reads `$PROD_LIST_DIR/{name}.csv` — *except* when `name == "system"`, which calls the stored procedure `GlobalMarketData.current_symbols_V3`. The `fin-deep-data` collectors instead call `DU.load_symbols_db(SYMBOL_PROC_VER, sym_type)` → `GlobalMarketData.current_symbols_{ver}` (V4: 863 rows on 2026-10-01; it already includes the stock- and ETF-options lists and the `portfolio_assets_info` members, so they add no union of their own). **V5 adds an `@type` argument** — `'a'` (eodDaily) returns that union minus delisted symbols, `'o'` (optChainEOD) also drops `SymbolMaster.options = 0`; 838 / 814 rows. V1–V4 take no argument, so `load_symbols_db` withholds the type for those and `SYMBOL_PROC_VER` can be flipped either way without a code change. DDL: `Ops/fin-deep-data/sql/current_symbols_V5.sql` (the owner runs it). MySQL has no default argument values, so "default `'a'`" lives in the caller and in the procedure body, not in the signature. Other server-side procedures the code depends on: `GlobalMarketData.get_us_symbol`, `GlobalMarketData.get_asia_symbol`, `Trading.sp_etf_trades_v2`, `Trading.sp_stock_trades_V3`. None are in the repo, so a schema change there breaks handlers silently.
 
@@ -133,8 +140,8 @@ SQLAlchemy 1.4.46; `venv-py313`: pandas 2.2.3 / SQLAlchemy 2.0.36 / numpy 2.1.3 
 yfinance 0.2.58), not whatever is newest. Each `pytest.ini` sets `pythonpath` to
 its own service folder, because handlers use flat imports.
 
-Coverage: `fin-deep-data` is covered end to end (320 tests — every handler, every
-Phase A helper). In `fin-cron-data` only `dataUtil.ExecSQL` and
+Coverage: `fin-deep-data` is covered end to end (416 tests on 2026-10-11 — every
+handler, every Phase A helper). In `fin-cron-data` only `dataUtil.ExecSQL` and
 `port_assets_handler` are covered; the other nine handlers remain uncovered
 (`TODOS.md` §2).
 
@@ -182,6 +189,11 @@ cd Ops/fin-deep-data
 ../../venv-py313/bin/python usrate_handler.py
 ../../venv-py313/bin/python fxeod_handler.py
 ../../venv-py313/bin/python intraday_min_handler.py [asia]
+../../venv-py313/bin/python fx_snapshot_handler.py
+../../venv-py313/bin/python fff_handler.py
+../../venv-py313/bin/python opt_snapshot_handler.py
+../../venv-py313/bin/python stock_snapshot_handler.py   # full V3 list, ~90 s
+../../venv-py313/bin/python news_handler.py             # six fixed tickers -> ./DATA
 ```
 
 Every `__main__` there supplies a dry-run event. **`localrun` alone is not an
@@ -206,7 +218,7 @@ serverless deploy function -f optHandler       # single function, much faster
 # de-duplicated against it and are unusable without it.
 make finDeep                                   # finDeepCore/Yf/Web.zip
 # then ALWAYS import-test the build trees before publishing: doc/OPERATIONS.md 10.3.2
-cd Ops/fin-deep-data && serverless deploy       # all eight functions
+cd Ops/fin-deep-data && serverless deploy       # all thirteen functions
 ```
 
 **A layer is not verified by a `CodeSha256` match.** On 2026-10-01 a `strip
@@ -246,7 +258,7 @@ Groups: DB (`DBHOST`, `DBPORT`, `DBUSER`, `DBPWD`, `DBMKTDATA`, `DBTRADING`, `DB
 
 The MySQL server runs with **`sql_require_primary_key=ON`**, so `StoreEOD`'s `to_sql(if_exists='append')` can never auto-create a table: any new target table must be created manually with a primary key first.
 
-`Ops/fin-deep-data/.env` adds, on top of the groups above: write targets (`EOD_WRITE_TBL`, `OPT_WRITE_TBL`, `TBLLOADAUDIT`, `TBLCORPACTION` — all **required, no fallback**, so `dataUtil.require_env` raises at startup rather than letting the string `None` reach SQL) · list and sharding (`SYMBOL_PROC_VER`, `EOD_SHARDS`, `EOD_BATCH`, `OPT_SHARDS`, `OPT_MAX_PARALLEL`) · upstream storage (`UPSTREAM_R2_BUCKET`, `OPT_RAW_PREFIX` — optChainEOD only; `STATUS_R2_KEY` was removed 2026-10-02 with statusReport's R2 upload) · status (`STATUS_EMAIL`; `STATUS_TOPIC_ARN` is injected by CloudFormation, never put it in `.env`) · index membership (`DJIA_PORT_NAME`, `HSI_PORT_NAME`) · layers (`FINDEEPCORE_LAYER_ARN`, `FINDEEPYF_LAYER_ARN`, `FINDEEPWEB_LAYER_ARN`). There, `PROD_LIST_DIR` is left **empty** on purpose: `dataUtil.list_dir()` then uses the packaged folder, which is correct both on Lambda and locally.
+`Ops/fin-deep-data/.env` adds, on top of the groups above: write targets (`EOD_WRITE_TBL`, `OPT_WRITE_TBL`, `TBLLOADAUDIT`, `TBLCORPACTION` — all **required, no fallback**, so `dataUtil.require_env` raises at startup rather than letting the string `None` reach SQL) · list and sharding (`SYMBOL_PROC_VER`, `EOD_SHARDS`, `EOD_BATCH`, `OPT_SHARDS`, `OPT_MAX_PARALLEL`) · upstream storage (`UPSTREAM_R2_BUCKET`, `OPT_RAW_PREFIX` — optChainEOD only; `STATUS_R2_KEY` was removed 2026-10-02 with statusReport's R2 upload) · 2026-10-11 ports (`TBLSNAPSHOT`, `TBLOPTSNAPSHOT`, `TBLFXSNAPSHOT`, `TBLFFF`, `SNAP_SYMBOL_PROC_VER`, `SNAP_THREADS`, `NEWS_R2_BUCKET`, `NEWS_THREADS` — the four tables and the two names required) · status (`STATUS_EMAIL`; `STATUS_TOPIC_ARN` is injected by CloudFormation, never put it in `.env`) · index membership (`DJIA_PORT_NAME`, `HSI_PORT_NAME`) · layers (`FINDEEPCORE_LAYER_ARN`, `FINDEEPYF_LAYER_ARN`, `FINDEEPWEB_LAYER_ARN`). There, `PROD_LIST_DIR` is left **empty** on purpose: `dataUtil.list_dir()` then uses the packaged folder, which is correct both on Lambda and locally.
 
 `Ops/fin-cron-Pgsql/dataUtil_Pgsql.py` hardcodes an absolute macOS dotenv path (`/Users/huangjunyi/...`) that does not exist in this WSL environment, and reads a different key set (`RHOST`, `DB`, `PORT`) — that folder cannot run locally without fixing this first.
 

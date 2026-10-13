@@ -10,7 +10,10 @@ and the tables they write.
 
 ## Changelog
 
+- 2026-10-12 | Modified | §6.1.1 `fx_snapshot_handler` reads a 5-day window and stamps each pair with its own last bar (`doc/OPERATIONS.md` §8.13).
 - 2026-10-12 | Modified | §6.6 `get_DBengine()` in the fin-deep-data fork now always connects over TLS (`DB_CONNECT_ARGS`), so a cold `caching_sha2_password` cache no longer needs `cryptography` (`doc/OPERATIONS.md` §8.11).
+- 2026-10-11 | Added | §6.1 five function rows and §6.1.1 — the five 2026-10-11 ports (FX snapshot, FFF, news, options snapshot, stock snapshot), their sources and what changed, and the one-transaction `replace_snapshot` write.
+- 2026-10-11 | Modified | §5 the two `Trading.sp_*` procedures and `current_symbols_V3` gain their fin-deep-data callers.
 - 2026-10-08 | Added | §6.3 decision row — the intraday dry-run CSVs hold the frame that would be stored, via `_as_stored()`, with the write path left alone.
 - 2026-10-07 | Added | §6.3 the intraday watermark is clamped to the 60-day yfinance limit — an older one made Yahoo reject the whole request and stalled that symbol permanently (`doc/OPERATIONS.md` §8.9).
 - 2026-10-06 | Added | §6.3 the FX download window is inclusive of its last date — `fetch_exchange_rates` asks yfinance for `end_dt + 1` and clamps back, because an exclusive `end` made the window zero-width whenever the watermark was the previous day (`doc/OPERATIONS.md` §8.8).
@@ -296,13 +299,13 @@ handlers silently.
 
 | Procedure | Used by |
 |---|---|
-| `GlobalMarketData.current_symbols_V3` | `dataUtil.load_symbols("system")` (fin-cron-data) |
+| `GlobalMarketData.current_symbols_V3` | `dataUtil.load_symbols("system")` (fin-cron-data); `cronHandlerv2` via `SNAP_SYMBOL_PROC_VER=V3`, so the snapshot's membership is unchanged |
 | `GlobalMarketData.current_symbols_V4` | `eodDaily`, `optChainEOD` via `dataUtil.load_symbols_db("V4")` (fin-deep-data). Takes no argument. 863 rows on 2026-10-01; it already contains the stock-options list, the ETF-options list and the `portfolio_assets_info` members, so the new handlers add no union of their own. No exclusions — delisted symbols are in it |
 | `GlobalMarketData.current_symbols_V5(IN p_type CHAR(1))` | the same two handlers once `SYMBOL_PROC_VER=V5`. V4's union **minus an exclusion list read from `GlobalMarketData.SymbolMaster`**: `@type='a'` drops `delisted = 1` (838 rows), `@type='o'` drops `options = 0 OR delisted = 1` (814). `eodDaily` asks for `'a'`, `optChainEOD` for `'o'`. A symbol with no `SymbolMaster` row is kept by both — 648 of the 863 are in that position, so `'o'` is an exclusion list, not a whitelist. DDL in `Ops/fin-deep-data/sql/current_symbols_V5.sql`; MySQL has no default argument values, so the caller always sends one |
 | `GlobalMarketData.get_us_symbol` | `eoddata_minhandler_us.py`; `intraday_min_handler.run_us` |
 | `GlobalMarketData.get_asia_symbol` | `eoddata_minhandler_asia.py`; `intraday_min_handler.run_asia` |
-| `Trading.sp_etf_trades_v2` | `opt_handler.py` |
-| `Trading.sp_stock_trades_V3` | `opt_handler.py` |
+| `Trading.sp_etf_trades_v2` | `opt_handler.py`; `opt_snapshot_handler` (optHandlerv2). Columns read: `Symbol`, `PnC`, `H_Strike`, `Expiration` |
+| `Trading.sp_stock_trades_V3` | `opt_handler.py`; `opt_snapshot_handler` (optHandlerv2). Columns read: `Symbol`, `PnC`, `Strike`, `Expiration` |
 
 `portAssetsHandler` depends on **none** of them — its symbol lists come from
 the public sources in §2.
@@ -328,6 +331,11 @@ declared on each function, never at provider level.
 | FXHistHandlerv2 | `fxeod_handler.run` | core + yf | 17:10 — **disabled** | `$TBLHISTFX`, `load_audit` |
 | yfus30minEODv2 | `intraday_min_handler.run_us` | core + yf | 20:05 — **disabled** | `$TBLMINUTEPRICE`, `load_audit` |
 | yfasia30minEODv2 | `intraday_min_handler.run_asia` | core + yf | 06:00 — **disabled** | `$TBLMINUTEPRICE`, `load_audit` |
+| FXrateHandlerv2 | `fx_snapshot_handler.run` | core + yf | hourly — **disabled** | `$TBLFXSNAPSHOT` (one-transaction replace), `load_audit` |
+| fffHandlerv2 | `fff_handler.run` | core | 12:00 on the 5th and 20th — **disabled** | `$TBLFFF` (INSERT IGNORE after the max `Date`), `load_audit` |
+| yfNewshandlerv2 | `news_handler.run` | core + yf | :01 hourly — **disabled** | R2 `NEWS_R2_BUCKET` (`NEWS/`, `FINANCIALS/`, `STATISTICS/`, `PROGRESS/`), `load_audit` |
+| optHandlerv2 | `opt_snapshot_handler.run` | core + yf | every 10 min 09:00–17:50 Mon–Fri — **disabled** | `$TBLOPTSNAPSHOT` (one-transaction replace), `load_audit` |
+| cronHandlerv2 | `stock_snapshot_handler.run` | core + yf | every 10 min 09:00–20:50 Mon–Fri — **disabled** | `$TBLSNAPSHOT` (one-transaction replace), `load_audit` |
 
 Schedules use EventBridge Scheduler (`method: scheduler`) with an explicit
 `timezone`, so they hold their exchange-local time across DST instead of
@@ -347,6 +355,27 @@ write `usrateHandler`, `FXHistHandler`, `yfus30minEOD`, `yfasia30minEOD` and
 `portAssetsHandler`. The status report keys on `(table_name, job)`, so it does
 not grow a second line at the cutover; `load_audit.host` says which function
 wrote the row.
+
+### 6.1.1 The five 2026-10-11 ports (TODOS §5.10)
+
+The last five python3.10 functions, each a new module in this service; the
+originals in `fin-cron-data` are unchanged. `load_audit.job` keeps the old name
+(`FXrateHandler`, `fffHandler`, `yfNewshandler`, `optHandler`, `cronHandler`).
+
+| Port | Source and method | Changed from the original |
+|---|---|---|
+| `fx_snapshot_handler` | `yf.download(FX_TICKERS, period=5d, interval=5m)` → each currency's last non-NaN Close, stamped with that currency's own bar time, plus `USD/USD = 1.0` | `5d`, not `1d`: Yahoo's FX day starts at London midnight, which used to drop the Asian pairs every evening; a currency with no bar in 5 days is left out instead of written NULL; `last_updated` is tz-naive UTC and `server_time` tz-naive ET, explicitly |
+| `fff_handler` | Ken French's `F-F_Research_Data_Factors_CSV.zip` via `requests` + `zipfile`; monthly block only, `YYYYMM` → month-end, percent ÷ 100 | replaces the unpackaged `getFamaFrenchFactors` (the original never ran, TODOS §4.1). Appends only months after the stored max — Ken French revises history slightly, and stored months are not rewritten |
+| `news_handler` | Yahoo search API per ticker + article page (bs4); quarterly fundamentals via yfinance | symbols from `current_symbols_V5('a')` instead of a missing CSV; one full pass per run on `NEWS_THREADS` worker threads, each over a disjoint `shard_symbols` sub-list; the R2 existence check happens **before** the page fetch; per-worker checkpoint in R2 for timeout resume |
+| `opt_snapshot_handler` | `CALL Trading.sp_etf_trades_v2` + `Trading.sp_stock_trades_V3` → `Ticker.option_chain` | one chain per (Symbol, Expiration) and one `history` per Symbol, instead of both per contract plus a 1 s sleep: 23 s for 73 contracts against 111 s |
+| `stock_snapshot_handler` | `current_symbols_V3` → one `Ticker.info` per symbol on `SNAP_THREADS` threads | the original's `history` + `info` per symbol, sequential, took 517 s on average and hit the 900 s timeout on a 10-minute schedule. `info` already carries `regularMarketOpen/DayHigh/DayLow/Price/Volume`; ~85 s for 856 symbols. Yahoo caps the request rate (~8–10/s), so threads beyond 8 do not help, and a batched `yf.download` was slower (110–155 s at any thread count). Also fills `quoteType`, a column the original never wrote |
+
+**Snapshot writes are one transaction now.** The three snapshot ports call
+`dataUtil.replace_snapshot()`, which runs the `DELETE` and the insert inside one
+`engine.begin()`: a reader never sees the table empty, a failed insert rolls the
+`DELETE` back, and an empty frame is a no-op that keeps the previous snapshot.
+The originals ran `ExecSQL(DELETE)` then `StoreEOD`, so a failed or empty fetch
+left the table empty until the next good run.
 
 ### 6.2 Data flow
 

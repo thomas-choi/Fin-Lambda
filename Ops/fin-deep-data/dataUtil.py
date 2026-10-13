@@ -536,6 +536,78 @@ def append_ignore(df, schema, table, chunk=500):
         logging.error(f"Exception occurred at append_ignore({schema}.{table})", exc_info=True)
 
 
+def replace_snapshot(df, schema, table):
+    """Replace a snapshot table's contents with df in ONE transaction.
+
+    The snapshot tables hold only the newest snapshot. fin-cron-data did this as
+    ExecSQL(DELETE) then StoreEOD -- two transactions -- so a reader could see
+    an empty table between them, and a failed or empty fetch emptied the table
+    for good. Here the DELETE and the insert commit or roll back together, and
+    an empty frame is a no-op that leaves the previous snapshot in place.
+
+    Returns the number of rows written, 0 for an empty frame, None on failure.
+    """
+    try:
+        if df is None or len(df) == 0:
+            logging.warning(f'replace_snapshot {schema}.{table}: empty frame, previous snapshot kept')
+            return 0
+        qualified = f'{schema}.{table}' if schema else table
+        with get_DBengine().begin() as conn:
+            conn.execute(text(f'DELETE FROM {qualified}'))
+            df.to_sql(name=table, con=conn, schema=schema, if_exists='append', index=False)
+        logging.info(f'replace_snapshot {qualified}: {len(df)} rows')
+        return len(df)
+    except Exception as e:
+        logging.error(f"Exception occurred at replace_snapshot({schema}.{table})", exc_info=True)
+
+
+def r2_client():
+    """boto3 S3 client for Cloudflare R2, from R2_ENDPOINT / R2_ACCESS_KEY_ID /
+    R2_SECRET_ACCESS_KEY. Raises when any of them is unset.
+
+    boto3 is imported here, not at module level: the Lambda runtime ships it,
+    and the functions that never touch R2 should not pay for the import.
+    """
+    import boto3
+
+    return boto3.client(
+        "s3",
+        endpoint_url=require_env("R2_ENDPOINT"),
+        aws_access_key_id=require_env("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=require_env("R2_SECRET_ACCESS_KEY"),
+        region_name="auto",
+    )
+
+
+#: head_object error codes that mean "no such key" -- R2 and S3 differ.
+R2_MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def r2_exists(client, bucket, key):
+    """True when the key exists, False when it does not.
+
+    Any other error (permissions, network) raises: treating it as "missing"
+    would re-fetch and re-upload everything on a credentials problem.
+    """
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code")
+        if str(code) in R2_MISSING_CODES:
+            return False
+        raise
+
+
+def r2_put_json(client, bucket, key, obj):
+    """Upload obj as UTF-8 JSON. Raises on failure."""
+    import json
+
+    client.put_object(Bucket=bucket, Key=key,
+                      Body=json.dumps(obj, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+                      ContentType="application/json")
+
+
 def audit_frame(rows):
     """Build a load_audit DataFrame from row dicts, in DDL column order.
 

@@ -7,6 +7,43 @@ Newest first.
 
 ---
 
+## 2026-10-14 — R2 403 on every news object; `r2_probe.py` access check
+
+### Goal
+A Lambda test invoke of `yfNewshandlerv2` failed every ticker that had news with
+`ClientError (403) … HeadObject: Forbidden` (583 errors, 0 articles stored). Find the cause and
+give the owner a repeatable way to verify R2 access before redeploying.
+
+### Root cause
+The R2 API token behind `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` has no object permissions:
+`fin-data` was granted *Workers AI Read/Write*, `fin-modal-data` *Workers R2 Storage Read/Write*.
+A local probe with the same keys got 403 / `AccessDenied` on head, head-object and list for both
+buckets. Not a code fault — `news_handler.py` and `dataUtil.r2_exists` behaved as designed.
+
+### Implementation detail
+- New `Ops/fin-deep-data/r2_probe.py`, a manual tool (not a Lambda, not packaged — `serverless.yml`
+  ships `!**`). Reads this folder's `.env` (or a path argument), then on `UPSTREAM_R2_BUCKET` and
+  `NEWS_R2_BUCKET` runs list → put → head → get (round-trip compared) → delete of
+  `_probe/r2_probe-<UTC stamp>.txt`. `--keep` skips the delete. Prints only a masked key id;
+  exit 0 only when every step passed on every bucket.
+- Fix is in the Cloudflare dashboard: an R2 token with **Object Read & Write** on both buckets,
+  new keys in `.env`, then `serverless deploy`. Pending at the time of writing.
+
+### Related files
+`Ops/fin-deep-data/r2_probe.py`, `Ops/fin-deep-data/tests/unit/test_r2_probe.py`,
+`doc/OPERATIONS.md` (§8.14, §9).
+
+### Test coverage
+New `Ops/fin-deep-data/tests/unit/test_r2_probe.py`, 7 tests with an in-memory fake S3 client (no
+network): all steps pass and the probe object is removed; `--keep` leaves it; a 403 bucket fails the
+run while the other bucket is still probed and nothing is deleted where nothing was put; an empty
+bucket list is not a pass; key masking; `main` exits before building a client when credentials or
+both bucket names are missing. `py_compile` and import clean in `venv-py313`; the file passes with
+`-W error::FutureWarning:r2_probe -W error::DeprecationWarning:r2_probe`; full suite 426 passed,
+1 skipped. No handler changed, so no dry run applies.
+
+---
+
 ## 2026-10-12 — FXrateHandlerv2: Asian pairs dropped every evening; yfinance cache on Lambda
 
 ### Goal

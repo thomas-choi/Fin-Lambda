@@ -281,7 +281,7 @@ functions:
     events:
       # 17:10 ET, matching the old 21:10 UTC entry in EDT.
       - schedule:
-          enabled: false             # cutover: retire FXHistHandler first
+          enabled: true             # cutover: retire FXHistHandler first
           method: scheduler
           rate: cron(10 17 ? * MON-FRI *)
           timezone: America/New_York
@@ -393,7 +393,7 @@ functions:
     events:
       # :01 past every hour, every day -- the old cron(1 * * * ? *).
       - schedule:
-          enabled: false            # cutover: old yfNewshandler has failed every run
+          enabled: true             # cutover: old yfNewshandler has failed every run
           method: scheduler
           rate: cron(1 * * * ? *)
           timezone: America/New_York

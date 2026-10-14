@@ -8,6 +8,7 @@ Running, deploying and debugging Fin-Lambda.
 
 ## Changelog
 
+- 2026-10-14 | Added | §8.14 — every `yfNewshandlerv2` R2 call returned 403: the R2 token lacks object permissions on `fin-data` and `fin-modal-data`. New manual tool `Ops/fin-deep-data/r2_probe.py`; matching §9 row. No code or layer change.
 - 2026-10-12 | Added | §8.13 — FXrateHandlerv2 dropped CNY/INR/IDR/MYR between London midnight and the Asia open (`period="1d"`); now a 5-day window. Provider env `XDG_CACHE_HOME=/tmp/.cache` for yfinance's cache. Changed §10.6 FX healthy shape. Redeploy only.
 - 2026-10-12 | Added | §8.11 — `statusReport` on Lambda failed every query with *"'cryptography' package is required for … caching_sha2_password"* after the `deepops` password rotation; `fin-deep-data` now connects over TLS. Matching §9 row. Redeploy only, no layer rebuild.
 - 2026-10-12 | Added | §8.12 — after the TLS fix, `Access denied (1045)` on Lambda: a `$` in `DBPWD` is expanded away at deploy time; §9 row; never put `$` in a `.env` value.
@@ -911,6 +912,30 @@ weekday evening and all of Sunday evening. The cache only cost extra timezone lo
 quote shows its real age. `serverless.yml` provider `environment: XDG_CACHE_HOME: /tmp/.cache`.
 Redeploy only, no layer rebuild.
 
+### 8.14 2026-10-14 — every R2 call from `fin-deep-data` is 403 Forbidden
+
+**Symptom.** A test invoke of `yfNewshandlerv2` logged `worker N: <TICKER> failed: ClientError: An
+error occurred (403) when calling the HeadObject operation: Forbidden` for every ticker that had
+news (583 of 840); tickers with no news logged `0 item(s), 0 new` because they never reached R2.
+
+**Root cause.** Credentials, not code. Probed locally with the same `.env` keys: `head_bucket`,
+`head_object` and `list_objects_v2` all return 403 / `AccessDenied` on **both** `fin-data` and
+`fin-modal-data`. The keys are well-formed (32/64 hex) and authenticate — a bad key would be
+`InvalidAccessKeyId` / `SignatureDoesNotMatch`. The token's policies were: `fin-modal-data` →
+*Workers R2 Storage Read/Write* (bucket management, apparently not object access); `fin-data` →
+*Workers AI Read/Write* (a different product). Nothing records these keys ever working: the old
+`fin-cron-data/.env` holds no R2 settings at all.
+
+**Blast radius.** No news stored by the v2 function (its schedule was still disabled). `optChainEOD`
+uses the same keys on `fin-data`, so its raw-chain archive would fail the same way. Nothing was
+overwritten: `DU.r2_exists` raises on any non-404 error rather than treating the key as missing.
+
+**Fix.** Create the token under R2 → *Manage R2 API Tokens* with **Object Read & Write** on
+`fin-data` and `fin-modal-data`, put its S3 Access Key ID / Secret Access Key in
+`Ops/fin-deep-data/.env`, verify with `../../venv-py313/bin/python r2_probe.py` (from
+`Ops/fin-deep-data`; writes and deletes `_probe/r2_probe-<stamp>.txt` in each bucket, exit 0 only
+when every step passes), then `serverless deploy` — new keys reach Lambda only at deploy time.
+
 ## 9. Troubleshooting
 
 | Symptom | Likely cause |
@@ -935,6 +960,7 @@ Redeploy only, no layer rebuild.
 | A snapshot table (`snapshot`, `options_snapshot`, `FX_snapshot`) did not refresh, with a `replace_snapshot … empty frame, previous snapshot kept` warning | The v2 snapshot run fetched nothing — Yahoo down or the symbol procedure empty. By design the old snapshot is kept rather than emptied; the `load_audit` row says `empty` |
 | `cronHandlerv2` `load_audit` row `partial`, log `time guard: <n> symbol(s) skipped` | the run reached 60 s before its 540 s timeout. Yahoo is slower than the measured ~85 s — check for rate limiting before raising `SNAP_THREADS`, which does not help against a rate cap |
 | `Can't connect to MySQL server on '=db-…'` / `Name or service not known` | A stray character in `DBHOST` — e.g. `DBHOST==host`. The masked host in the `setup DBengine` line shows it. See §8.10 |
+| `ClientError … (403) when calling the HeadObject operation: Forbidden` on every R2 key | The R2 token lacks *Object Read & Write* on that bucket. Run `r2_probe.py` from `Ops/fin-deep-data`; see §8.14 |
 | `required environment variable X is not set` at startup | `dataUtil.require_env` raising by design, before any SQL is built. Add the key to `Ops/fin-deep-data/.env` |
 | Two sets of rows per session in `histminprice` / `FX_histdaily` / `USRates` | A v2 schedule was enabled while the python3.10 function was still deployed. Disable one; see §11 |
 | `import dataUtil` in a test picks up the wrong service | The two pytest roots were mixed. Run `fin-deep-data` tests from its own folder |

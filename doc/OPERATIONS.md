@@ -8,6 +8,8 @@ Running, deploying and debugging Fin-Lambda.
 
 ## Changelog
 
+- 2026-10-30 | Added | §12 — `histLevels` operations (planned, TODOS §7 / PLAN Part II): env table (`TBLDAILYLEVELS`, `VA_RATIO`, `PROFILE_BUCKET`, `LEVELS_MIN_SPAN_MIN`, `LEVELS_COVERAGE`), owner prerequisites (DDL, intraday-source check, `enabled:`-literal reconciliation), §10.4.1 deploy-enable flow, 21:30 ET schedule row, dry-run shape + new golden CSV, monitoring, rollback.
+
 - 2026-10-14 | Added | §8.14 — every `yfNewshandlerv2` R2 call returned 403: the R2 token lacks object permissions on `fin-data` and `fin-modal-data`. New manual tool `Ops/fin-deep-data/r2_probe.py`; matching §9 row. No code or layer change.
 - 2026-10-12 | Added | §8.13 — FXrateHandlerv2 dropped CNY/INR/IDR/MYR between London midnight and the Asia open (`period="1d"`); now a 5-day window. Provider env `XDG_CACHE_HOME=/tmp/.cache` for yfinance's cache. Changed §10.6 FX healthy shape. Redeploy only.
 - 2026-10-12 | Added | §8.11 — `statusReport` on Lambda failed every query with *"'cryptography' package is required for … caching_sha2_password"* after the `deepops` password rotation; `fin-deep-data` now connects over TLS. Matching §9 row. Redeploy only, no layer rebuild.
@@ -1593,3 +1595,122 @@ Compress the loader cache (`tar --zstd` of `Ops/yfinance` and
 `Ops/OptionsChain`, 4.5 GB raw) into R2 `sr-agent/raw/myfindata-cache/` as
 write-once, `git tag final-cron 19c8509` in myFinData with a README pointer
 here, and retire the droplet scripts after 30 days.
+
+---
+
+---
+
+## 12. `histLevels` — daily VWAP + volume-profile levels (TODOS §7, planned)
+
+Planned second increment of the fin-deep-data service: one new function
+`histLevels` (`hist_levels_handler.py`, python3.13), one new companion table
+`histdailylevels`, one new nightly schedule. Design: `doc/TECHNICAL-DESIGN.md`
+PART 2; plan (phases, tests, gates): `PLAN.md` Part II. This section records
+the operations side only — env, deploy, enable, dry-run, monitoring. All of it
+is **draft** until PLAN Part II is approved.
+
+### 12.1 New env vars (`Ops/fin-deep-data/.env` + `.env.example`, same change)
+
+| Env var | Default | Read by | Meaning |
+|---|---|---|---|
+| `TBLDAILYLEVELS` | `histdailylevels` | histLevels | target table (required-with-default; the DDL creates it owner-side) |
+| `VA_RATIO` | `0.70` | histLevels | value-area share of volume around POC |
+| `PROFILE_BUCKET` | `10` (cents grid) | histLevels | close-price bucket size for the profile |
+| `LEVELS_MIN_SPAN_MIN` | `60` | histLevels | sessions with a smaller bar span are skipped entirely |
+| `LEVELS_COVERAGE` | `0.80` | histLevels | bucket-coverage threshold above which VWAP is `vwap_bucketed` |
+
+Per the absent-var rule (CLAUDE.md §3.3): test L9 asserts documented defaults
+apply when any of them is unset.
+
+### 12.2 Prerequisites (owner actions, before the first real invoke)
+
+| # | Action | Why it blocks |
+|---|---|---|
+| 1 | Run `Ops/fin-deep-data/sql/histdailylevels.sql` against MySQL (idempotent `CREATE TABLE IF NOT EXISTS`, PK `(Date, Symbol, Exchange)`) | `sql_require_primary_key=ON` — `StoreEOD`/`append_ignore` can never auto-create the table |
+| 2 | Confirm `yfus30minEODv2` completed its last 5 scheduled runs (CloudWatch) | The levels collector reads only what that collector landed; a stalled source starves it |
+| 3 | Reconcile `serverless.yml` `enabled:` literals with the live schedules (§10.5 caveat) | Deploying with stale literals reverts the enabled schedules and silently stops the shadow run |
+
+### 12.3 Deploy and bring online (same flow as §10.4.1)
+
+```bash
+cd Ops/fin-deep-data
+serverless print                     # renders config, no AWS call
+serverless package                   # renders 9 functions / 12 schedules
+serverless deploy function -f histLevels
+# dry run in the real environment -- real layers, real runtime, no writes:
+serverless invoke -f histLevels -d '{"dbFlag":false,"test":3}' --log
+```
+
+Check the returned JSON summary and the CloudWatch log for a clean import and
+no stack trace. Then one real invoke with `{"test": 3}` (3 symbols) and
+`dbFlag` defaulting true — verify rows:
+
+```sql
+SELECT COUNT(*), MIN(vwap), MAX(vwap)
+FROM histdailylevels WHERE Date = <session>;
+```
+
+plus one symbol's VWAP hand-check (PLAN §II.7.4: independent pandas snippet,
+4-significant-digit agreement), the `load_audit` `'*'` summary row under
+`job='histLevels'`, and the `v_load_status` line. Only after that: set
+`enabled: true` on `histLevels`'s schedule in `serverless.yml` (a literal —
+§10.4.1's `${env:}` warning applies) and redeploy. **Verify the enablement
+against AWS, not the file:**
+
+```bash
+aws scheduler get-schedule --name fin-deep-data-dev-histLevels \
+  --region us-east-2 --profile ServerLessUser \
+  --query '[State,ScheduleExpression,ScheduleExpressionTimezone]'
+```
+
+### 12.4 Schedule
+
+| Function | Local time | Why |
+|---|---|---|
+| histLevels | **21:30 ET Mon–Fri** (`cron(30 21 ? * MON-FRI *)`, tz `America/New_York`) | After `yfus30minEODv2` (20:05 ET) has landed the completed US session's bars. statusReport (20:00) reports the previous day's levels row the first morning; current from the second. Phase II.3 re-confirms the offset against the measured intraday finish time |
+
+Single invocation/day — no concurrency-quota interaction (account limit 10,
+§10.5). No layer rebuild: coreLayer-only package, pure redeploy plus DDL.
+
+### 12.5 Dry run and healthy-run shape
+
+```bash
+cd Ops/fin-deep-data
+../../venv-py313/bin/python hist_levels_handler.py    # localrun, dbFlag False, test 3
+```
+
+Reads MySQL (symbols, bars) like every dry run; writes no table and no
+`load_audit` row. Output `hist_levels_<asof>.csv`: one row per
+(Symbol, Exchange, session) — **the frame that would be stored**, §II.3 column
+order. A healthy US trading day shows one row per intraday symbol, `n_buckets`
+≈ 26, `method = vwap_bucketed`, `bucket_size` per the env grid. Expected, not
+failures: half-day sessions (lower `n_buckets`; typical fallback may fire and
+`method` says so), symbols with no bars that day (absent rows — the §8.9
+analogue), `0 row(s)` on a market holiday (`audit_summary(status='empty')`,
+exit 0).
+
+**Golden CSV — new baseline:** the first dry-run output is committed as
+`Ops/fin-deep-data/hist_levels_golden.csv` and becomes this service's §3.5
+reference for the handler (none exists today; this change creates it —
+announced here per the removal/addition rule).
+
+### 12.6 Monitoring
+
+- **statusReport** — `INFERRED_TABLES` gains
+  `("DBMKTDATA", "TBLDAILYLEVELS", "histdailylevels", "Date")`; the report
+  alerts when the last `ok` summary is older than one trading day.
+- **First week** — after each run check
+  `SELECT MAX(Date), COUNT(*) FROM histdailylevels`: `MAX(Date)` = the
+  completed session, `COUNT` ≈ intraday symbols × sessions accumulated.
+- **SR-Agent (downstream)** — treats missing levels as
+  `vwap_available = 0` / `levels_available = 0` (its Stage-A DQ), so a silent
+  collector failure degrades SR features, not SR correctness; the
+  statusReport alert is the tripwire for exactly that drift.
+
+### 12.7 Rollback
+
+Disable the schedule (`enabled: false`, redeploy) — the table simply stops
+growing; nothing else writes or reads it in this service. Re-running after a
+fix is safe: INSERT IGNORE on the PK keeps the first computation of a session
+(a replay never changes history; re-backfill of a *corrected* session is a
+manual DELETE + re-invoke, documented here when it is ever needed).

@@ -9,6 +9,8 @@ for data consumers — no handler names, no SQLAlchemy, no event flags.
 
 ## Changelog
 
+- 2026-10-30 | Added | Dataset-catalogue row + full section for **Daily VWAP and volume-profile levels** (`histdailylevels`, planned — PLAN Part II / TODOS §7): what it will contain, how to read it, coverage mirrors the intraday bars, marked *not yet built*.
+
 - 2026-10-12 | Modified | dataset catalogue, FX spot — with the replacement, every currency stays in the snapshot overnight; `last_updated` shows each currency's own last quote.
 - 2026-10-11 | Modified | dataset catalogue — FX spot stale since 2026-10-06; Fama-French and news marked not collecting, with what the replacements will deliver; stock snapshot freshness and `quoteType`; empty runs no longer clear a snapshot table.
 - 2026-10-07 | Modified | the dataset catalogue's intraday-bars row: 61 symbols carry a history gap, and bars older than 60 days cannot be back-filled from the source.
@@ -33,6 +35,7 @@ for data consumers — no handler names, no SQLAlchemy, no event flags.
 | Daily prices | `GlobalMarketData.histdailyprice7` | daily, after the US close | same evening. ~863 symbols across US, HK, CN, KR, TW, JP and crypto — see *Which symbols are covered* |
 | **EOD option chains** | `GlobalMarketData.OptionChains` | daily, after the US close | same evening; filtered, see below |
 | **Corporate actions** | `GlobalMarketData.corp_action_daily` | daily, only when there is one | ≤ 1 business day |
+| **Daily VWAP + volume-profile levels** | `GlobalMarketData.histdailylevels` | daily, US session | same evening (planned; not yet built — see its own section) |
 | **Load record (per dataset, per symbol)** | `GlobalMarketData.load_audit`, summarised by `GlobalMarketData.v_load_status` | one row per symbol per collection run | minutes after the run |
 | **Daily load-status report** | e-mail (the same figures stay queryable in `v_load_status`) | weekdays 20:00 ET | — |
 | FX spot | `GlobalMarketData.FX_snapshot` | hourly | ~1 hour; latest only. **Stale since 2026-10-06 22:00 ET** — the hourly job was switched off on 2026-10-07; a replacement is ready and waiting to be switched on. With the replacement, every currency stays in the snapshot outside its trading hours, carrying its last quote; check `last_updated`, which is per currency, to see how old a rate is (Asian currencies lag by an hour or more in the US evening) |
@@ -210,6 +213,44 @@ last *run*, not their last data date.
 
 ---
 
+
+## Daily VWAP and volume-profile levels — `GlobalMarketData.histdailylevels` (planned)
+
+> **Status: not yet built.** Planned as the service's next increment
+> (`PLAN.md` Part II, TODOS §7). Everything below describes the table as
+> designed; no rows exist until that plan is approved, built and enabled.
+
+One row per `(session, symbol, exchange)` with the day's volume-derived price
+levels, computed from the 15-minute bars the service already collects — no new
+source, and yfinance is not called at all on the hot path:
+
+| Column | Meaning |
+|---|---|
+| `Date` | session date, in the exchange's local calendar |
+| `Symbol`, `Exchange` | as in the price tables |
+| `vwap` | true session VWAP — volume-weighted average of the 15-minute bucket closes, not the `(H+L+C)/3` approximation |
+| `poc` | price bucket where the most volume traded that session |
+| `vah` / `val` | bounds of the 70% value area around the POC |
+| `n_buckets` | 15-minute buckets the session actually had |
+| `bucket_size` | price-bucket size used for the profile (0 when only VWAP was computed) |
+| `method` | `vwap_bucketed`, or `vwap_typical` when a sparse session fell back to the typical-price approximation |
+| `source` | provenance of the computation (`histminprice-15m`) |
+| `first_seen_at` | UTC time the row was first computed — usable as the row's `available_at` |
+
+How to read it:
+
+- Join to `histdailyprice7` on `(Date, Symbol)`; a session with no row means
+  no reliable computation for that symbol that day (missing bars, or the
+  session was too short to profile) — a missing row is *absence*, not a
+  zero or a stale value.
+- `method = vwap_typical` flags half-days and sparse sessions; the VWAP on
+  those rows is the documented approximation, not the bucketed one.
+- Coverage mirrors the intraday bars: the 61 symbols with `histminprice`
+  history gaps have level gaps on exactly the same dates.
+- Freshness: computed at 21:30 ET after the intraday bars land (20:05 ET), so
+  the completed US session's levels are available the same evening.
+
+---
 ## Corporate actions — `GlobalMarketData.corp_action_daily`
 
 Cash dividends and stock splits, one row per `(ex-date, symbol, exchange)`:

@@ -471,3 +471,208 @@ Creating four repo-wide docs is a real chunk of work sitting behind a ~250-line 
 - Index **weights** — `Rate` is the FX rate to USD (`1.0`), so no weight source is needed. This is why the SPY holdings file is only a membership cross-check and Invesco/QQQ being unavailable does not block anything.
 - Any non-US index, and any non-USD currency handling.
 - Backfilling historical membership. The first run seeds a single dated set; there is no history before it.
+
+---
+
+---
+
+# PART II — PLAN: `histdailylevels` — daily VWAP + volume-profile levels from 15-minute bars
+
+Status: **DRAFT — awaiting approval**
+Created: 2026-10-30
+Owner: Thomas Choi
+Request: `TODOS.md` §7.1 / §7.2 (SR-Agent downstream feature request, owner-approved 2026-10-29)
+
+---
+
+## II.1 Goal
+
+One new python3.13 Lambda in `Ops/fin-deep-data/` that, per US trading session:
+
+1. Reads the 15-minute bars of that session from `GlobalMarketData.histminprice` (no new upstream fetch — yfinance is not called at all on the hot path).
+2. Aggregates them per symbol into **daily level rows**:
+   - **§7.1 VWAP** — true session VWAP, `Σ(price×vol) / Σ(vol)` over the 15-minute buckets, not the `(H+L+C)/3` typical-price approximation;
+   - **§7.2 volume-profile levels** — POC (price bucket with max traded volume), VAH / VAL (70 % value-area bounds), on a configurable price-bucket grid.
+3. Appends them to a new companion table **`GlobalMarketData.histdailylevels`** — `Date, Symbol, vwap, poc, vah, val, n_buckets, bucket_size, method, source` — never new columns on `histdailyprice7`, so a missed day is a missing row, not a NULL beside a real close.
+4. Writes per-symbol + `'*'` summary rows to `load_audit` under a **new job name `histLevels`** (new data set ⇒ its own job; it has no python3.10 predecessor, so no name to preserve).
+5. Falls back to typical-price VWAP only when a session has < 80 % of expected buckets, recording which method was used in `method` (`vwap_bucketed` / `vwap_typical`).
+
+### Decisions already made (from TODOS §7 + owner review)
+
+| Question | Decision |
+|---|---|
+| Which symbols? | Every symbol that has 15-minute bars that session — i.e. the US intraday universe as-is. The `SYMBOL_PROC_VER` procedure is used only for the **expected-bucket** count, never to force coverage. Asia bars are processed the same way under their own exchange session (Phase-gated, see II.6 P5) |
+| Which sessions? | The **latest completed session per exchange** (intraday handler's own session logic, reused). A missed session is not back-filled — `histminprice` itself cannot back-fill beyond 60 days, so levels would silently disagree with the bars |
+| New table or new columns? | **New table `histdailylevels`**, per §7.1. Companion, not a `histdailyprice7` extension |
+| Write path | `DU.append_ignore()` (INSERT IGNORE) on PK `(Date, Symbol, Exchange)` — the first computation of a session wins; a replay never changes history. Same idempotency contract as every historical table in this service |
+| Job name | `histLevels` — new data set, no cutover, appears as its own `v_load_status` line |
+| Upstream owner item? | **None** — no stored procedure, no new upstream source, no R2. This is the first data set the service derives entirely from data it already collects |
+
+### Open assumptions — flag now, confirm before coding
+
+| # | Assumption | Why it matters |
+|---|---|---|
+| B1 | `histminprice.Volume` is per-bucket share volume summed over the bucket (yfinance semantics), and `0`/NULL volume bars can be skipped rather than treated as zero-price weight | If Volume were cumulative, VWAP would be wrong by construction. One verification query against the live table (Phase II.0) settles it: pick a symbol-day, compare bucket sums against the day's known volume in `histdailyprice7` |
+| B2 | Exchange **session** definition can be derived from the bars themselves (min/max `Datetime` per symbol-day) without an exchange calendar table | Self-consistent with what the intraday collectors actually captured. A proper exchange-calendar cross-check (half-days!) is an enhancement, not a blocker — a half-day simply yields fewer buckets and falls into the < 80 % path |
+| B3 | The `expected_buckets` count for the 80 % rule = `(session span) / 15min` per exchange, computed from the bars' own first/last bucket; symbols with span < 60 min are skipped entirely (illiquid/half-day junk) | Without this, a sparse-but-real session (e.g. an ETF that trades 30 buckets) would be permanently demoted to typical-price. The 60-min floor keeps the fallback honest |
+| B4 | The Lambda DB user needs `CREATE` on `GlobalMarketData` **once** (owner runs the DDL script instead — same as `upstream_tables.sql`, so actually the owner runs it and the Lambda needs only INSERT/SELECT) | DDL is owner-run per repo convention (`sql/histdailylevels.sql`, Phase II.0) |
+| B5 | Value-area = 70 % of traded volume around POC, standard profile expansion (expand to the larger neighbour until ≥ 70 % captured) | Configurable via env `VA_RATIO` (default `0.70`); TODOS §7.2 names 70 % |
+
+---
+
+## II.2 Source research — what exists to build on
+
+| Fact | Checked |
+|---|---|
+| `histminprice` holds `Datetime` (exchange-local, tz-naive), `Symbol`, `Exchange`, `Close/Open/High/Low/Volume/AdjClose`, `UTCDatetime`, `timezone`; neither datetime carries an offset; `timezone` is per row | `doc/API-REFERENCE.md` §7.6.1, verified on live rows 2026-10-08 |
+| US 15-min bars land 20:05 ET Mon–Fri (`yfus30minEODv2`), Asia 06:00 ET (`yfasia30minEODv2`); both write `load_audit` summary rows under jobs `yfus30minEOD` / `yfasia30minEOD` | `doc/TECHNICAL-DESIGN.md` §6.1 |
+| `DU.load_df_SQL()` returns a DataFrame for any SELECT; `DU.append_ignore()` is the INSERT IGNORE write used by every historical table; `DU.audit_run/audit_summary` never raise | `doc/TECHNICAL-DESIGN.md` §6.6 |
+| `statusReport` discovers tables via `INFERRED_TABLES` / `EVENT_TABLES` in `status_report_handler.py` — a new table is added to `INFERRED_TABLES` (it has a real `Date`) | handler source, lines 50–62 |
+| `sql_require_primary_key=ON` — the table must be created by DDL script, not by `to_sql` | `CLAUDE.md` Configuration |
+| The intraday collector clamps watermarks to 60 days and cannot back-fill older gaps | `doc/OPERATIONS.md` §8.9 |
+
+No external source research needed — this plan consumes an internal table only.
+
+## II.3 Target table
+
+`GlobalMarketData.histdailylevels` (new; DDL in `Ops/fin-deep-data/sql/histdailylevels.sql`, owner-run, idempotent):
+
+| Column | Type | Meaning |
+|---|---|---|
+| `Date` | `DATE` | session date, exchange-local |
+| `Symbol` | `VARCHAR(45)` | yfinance ticker, as stored in `histminprice` |
+| `Exchange` | `VARCHAR(45)` | copied from the bars |
+| `vwap` | `DOUBLE` | Σ(price×vol)/Σ(vol); typical-price fallback when bucket coverage < 80 % |
+| `poc` | `DOUBLE` null | price bucket with max traded volume (NULL when < 60 min span) |
+| `vah` | `DOUBLE` null | value-area high, `VA_RATIO` of volume around POC |
+| `val` | `DOUBLE` null | value-area low |
+| `n_buckets` | `INT` | 15-min buckets actually used |
+| `bucket_size` | `INT` | price-bucket size used for POC/VA (USD-cents grid default; `0` when only VWAP computed) |
+| `method` | `VARCHAR(20)` | `vwap_bucketed` / `vwap_typical` — which path produced `vwap` |
+| `source` | `VARCHAR(20)` | `histminprice-15m` (provenance; a future tick-level recompute would write a different value) |
+| `first_seen_at` | `DATETIME(3)` | UTC, `DEFAULT CURRENT_TIMESTAMP(3)` — honest available-at, same trick as `corp_action_daily` |
+| `run_id` | `CHAR(26)` | `load_audit.run_id` of the computing run |
+
+Primary key `(Date, Symbol, Exchange)` — INSERT IGNORE keeps the **first** computation of a session, matching the corp-action idempotency contract. Joins on `Symbol` need no COLLATE (same charset as `histdailyprice7`).
+
+## II.4 Design
+
+**Pipeline (one function, `hist_levels_handler.py`):**
+
+```
+schedule (new, disabled on deploy)
+  → read candidate bars: SELECT ... FROM histminprice
+      WHERE UTCDatetime >= (UTC now − 36h)      -- one scan window, both markets
+  → group by (Exchange, Symbol, session date from exchange-local Datetime)
+  → per group:  n_buckets, span check (≥ 60 min)
+      → VWAP = Σ((H+L+C+L)/4? no — Close×Vol)   [close-to-close per bucket;
+        typical-price×volume cross-check in tests]
+      → coverage = n_buckets / expected(span/15min)
+      → method = vwap_bucketed if coverage ≥ 0.80 else vwap_typical
+      → volume profile on close-price grid (bucket_size from env):
+            POC = argmax volume bucket
+            expand to VAH/VAL until ≥ VA_RATIO captured
+  → append_ignore(df, 'GlobalMarketData', 'histdailylevels')
+  → load_audit: one row per symbol + '*' summary (job 'histLevels')
+```
+
+**Key choices, with reasons:**
+
+| Choice | Why |
+|---|---|
+| Read bars by `UTCDatetime` window, group by exchange-local `Datetime` for session date | `UTCDatetime` is the only monotone-safe filter; session dates come from the per-row `timezone` |
+| One scan window (36 h) instead of per-exchange queries | simpler; ~2.3 M rows/36 h ≈ within one 900 s Lambda comfortably at pandas speed; the grouping is pure pandas |
+| No yfinance call anywhere | the whole point: derived data, zero upstream quota |
+| `load_audit` rows per symbol | same contract as eodDaily; `v_load_status` then reports the new table for free once `INFERRED_TABLES` gains one line |
+| `method` column records the fallback | TODOS §7.1 explicitly requires knowing which method produced the value; SR-Agent reads it as a DQ hint |
+| VWAP uses **Close** of each 15-min bucket (not H/L/typical) | the bucket close is the best unbiased estimate of volume-weighted mean trade price at 15-min granularity; H+L+C+L/4 biases high; documented here so the tests pin it |
+| Schedule **21:30 ET Mon–Fri** | after yfus30minEODv2 (20:05) and its data settle, before statusReport (20:00? — no: 21:30 is *after* 20:00 statusReport; the report simply picks the table up next day — acceptable for a T+1 derived set) — final time confirmed in Phase II.3 against the live `yfus30minEODv2` completion time |
+
+**What is deliberately NOT here:** no Asia-specific schedule yet (P5 below), no R2 archive (a daily level row is 13 numbers — R2 stores nothing worth archiving), no back-fill of sessions before deploy (bars older than 60 days cannot serve; sessions between deploy and today are filled by the sweep on the next run only from bars still within the 60-day window).
+
+## II.5 Python 3.13 layer and build tooling
+
+No new layer. `hist_levels_handler.py` needs `pandas` + `sqlalchemy` + `pymysql` (all in `finDeepCore`) and nothing else — `numpy`/`pytz` are transitive in the same layer. Packaging: `dataUtil.py`, `hist_levels_handler.py` in `package.patterns`; layers `coreLayer` only. No `requirements_*.txt` change, **no layer rebuild** — a pure redeploy plus DDL.
+
+## II.6 Phases
+
+| Phase | Work | Gate |
+|---|---|---|
+| **II.0 — Confirm** | Owner verifies **B1** (Volume semantics): one query per symbol-day joining `histminprice` bucket sums against `histdailyprice7` Volume for 3 symbols × 3 recent days. Owner runs `Ops/fin-deep-data/sql/histdailylevels.sql` (idempotent DDL: table + grants unchanged). Confirm the intraday summary rows in `load_audit` for the latest US session (`job='yfus30minEOD'`, `status='ok'`) | B1 answered in writing; DDL present. Nothing is coded until Volume semantics are confirmed |
+| **II.1 — Module + tests** | `hist_levels_handler.py` with pure functions (`session_groups`, `bucket_vwap`, `volume_profile`, `value_area`, `fallback_typical`, `build_frame`) + `tests/unit/test_hist_levels_handler.py` (fixture frames, no network/DB; sqlite mirror of the DDL like `test_dataUtil.py` does for load_audit) | All unit tests green in `venv-py313`; warning gate clean for the new module |
+| **II.2 — Wire-in** | `serverless.yml` function `histLevels` (schedule **disabled**, `coreLayer`, package patterns); `status_report_handler.py` `INFERRED_TABLES` += `("DBMKTDATA", "TBLDAILYLEVELS", "histdailylevels", "Date")`; `.env.example` += `TBLDAILYLEVELS`, `VA_RATIO`, `PROFILE_BUCKET`, `LEVELS_MIN_SPAN_MIN`, `LEVELS_COVERAGE`; dry-run `__main__` like every handler | `serverless print` + `serverless package` succeed; existing 426+ tests still green |
+| **II.3 — Schedule confirm** | Read CloudWatch: latest `yfus30minEODv2` actual finish time. Set the cron so it fires ≥ 60 min after that (proposal: 21:30 ET Mon–Fri). Confirm no collision with the concurrency quota (single function, one invocation/day) | Time fixed in writing + `doc/OPERATIONS.md` §10.5 row |
+| **II.4 — Deploy + verify** | Deploy (no layer change), manual invoke `{"test": 3}` → `{"localrun": true, "dbFlag": false}` dry run first; then one real invoke with `dbFlag: true`; verify rows: `SELECT COUNT(*), MIN(vwap), MAX(vwap) FROM histdailylevels WHERE Date = <session>`; spot-check one symbol's VWAP by hand against its bars; confirm `load_audit` summary row + `v_load_status` line | Row counts sane; hand-computed VWAP matches to 4+ digits; audit row present |
+| **II.5 — Enable + document** | Flip schedule `enabled: true`, redeploy; observe next scheduled run via CloudWatch; docs per §II.8; `TODOS.md` §7.1/§7.2 → DONE with pointer to this plan | Morning-after check: `v_load_status` shows `histLevels` `ok`, `n_rows > 0` |
+
+## II.7 Test section (mandatory per `CLAUDE.md` §3)
+
+### II.7.1 Must pass all existing verification
+
+- Full `fin-deep-data` suite green in `venv-py313` (426 tests as of 2026-10-14) — this change touches `status_report_handler.py` (one list entry) and `serverless.yml`; both existing test files must stay green untouched or with an updated expected-table list.
+- `serverless print` and `serverless package` from `Ops/fin-deep-data/` succeed with the new function present.
+- Existing handlers are untouched — no dry-run regression required beyond the intraday pair's own golden CSVs (their module is not modified at all).
+- `statusReport` dry run re-run to show the new inferred line renders when the table exists (and does not crash when it does not — the `env_or` default path).
+
+### II.7.2 Removal of obsolete verification
+
+**None.** Nothing is retired: no handler, event flag, CSV, symbol list, or stored procedure changes.
+
+### II.7.3 New tests (`tests/unit/test_hist_levels_handler.py`)
+
+| # | Target | Assertion |
+|---|---|---|
+| L1 | `session_groups()` | Fixture bars (2 symbols, 2 exchanges, 3 sessions) → correct per-(exchange, symbol, date) groups; session date derived from exchange-local `Datetime`, never `UTCDatetime` |
+| L2 | `bucket_vwap()` | Hand-computed: 4 buckets, known close/volume → exact VWAP to 1e-9; zero-volume session → `None`, not 0 |
+| L3 | coverage + method | 78 % of buckets → `vwap_typical`; 85 % → `vwap_bucketed`; boundary at exactly 80 % → bucketed (≥, per TODOS §7.1 wording) |
+| L4 | `fallback_typical()` | `(H+L+C)/3` matches hand computation; recorded as `method='vwap_typical'` |
+| L5 | `volume_profile()` | 5-bucket fixture → POC = argmax; `bucket_size` respected; all-equal volumes → POC = lowest such bucket (deterministic tie-break) |
+| L6 | `value_area()` | 70 % captured exactly at 3 buckets → VAH/VAL = those bounds; expansion order (larger neighbour first) pinned |
+| L7 | `build_frame()` | Exact column set/order matches §II.3; `Date` is `date` not `Timestamp`; `first_seen_at` UTC-naive |
+| L8 | span floor | Session span 45 min → row skipped entirely (no VWAP, no levels), logged |
+| L9 | env defaults | `VA_RATIO`/`PROFILE_BUCKET`/`LEVELS_*` unset → documented defaults used, run proceeds (per CLAUDE.md §3.3 for new env vars) |
+| L10 | `dbFlag=False` | No `append_ignore`, no `audit_run`; CSV still written via `out_dir` |
+| L11 | idempotency (sqlite) | Same frame twice → second `append_ignore` inserts 0 rows on the PK (sqlite mirror of the DDL, per the `test_dataUtil.py` pattern) |
+| L12 | `load_audit` summary | `'*'` row carries `job='histLevels'`, `table_name=histdailylevels`, `n_rows` = symbols written; audit failure never fails the run (exception injected) |
+| L13 | Network policy | Autouse no-socket fixture holds (module makes zero outbound calls) |
+
+### II.7.4 Non-unit verification
+
+| Check | Detail |
+|---|---|
+| Local dry run | `cd Ops/fin-deep-data && ../../venv-py313/bin/python hist_levels_handler.py` — `{"localrun": true, "dbFlag": false, "test": 3}`; expect `hist_levels_<date>.csv` with ≥ 3 rows for 3 capped symbols, no stack trace |
+| Golden CSV — new | Commit the first dry-run output as `Ops/fin-deep-data/hist_levels_golden.csv`; it becomes §3.5's reference for this handler (none exists today — this change creates the baseline, stated explicitly) |
+| Config validation | `serverless print` + `serverless package` with the new disabled schedule |
+| DB write validation | First real write against the new table only — there is no production collision risk (new table), but the first invoke still uses `{"test": 3}` (3 symbols) before a full run |
+| Post-deploy check | After the first scheduled run: CloudWatch clean; `SELECT COUNT(*) FROM histdailylevels WHERE Date = <yesterday>` ≈ US intraday symbol count; `v_load_status` line appears |
+| Hand-computation regression | One symbol-day recomputed by an independent pandas snippet (in the test file as L2's data); live row must match to 4 significant digits |
+
+## II.8 Documentation obligations
+
+| File | Update |
+|---|---|
+| `HISTORY.md` | Full entry per the mandatory template (goal, implementation, related files, test coverage) — created when the change lands |
+| `doc/TECHNICAL-DESIGN.md` | §1/§6.1 function table row; §6.2 data-flow diagram + the new branch; §6.3 decision rows (bucket-Close VWAP, first-wins idempotency, no-yfinance derivation); §6.6 `dataUtil` API section gains nothing (no new helpers); **§6.7 new table** `histdailylevels` with column reference |
+| `doc/OPERATIONS.md` | §10.2 env rows (`TBLDAILYLEVELS`, `VA_RATIO`, `PROFILE_BUCKET`, `LEVELS_MIN_SPAN_MIN`, `LEVELS_COVERAGE`); §10.5 schedule row + enable-state note; §10.6 dry-run command + healthy shape; §7 constraint note (36 h scan window, 900 s timeout headroom) |
+| `doc/PRODUCT-GUIDE.md` | Dataset-catalogue row: "Daily VWAP + volume-profile levels" — what it contains, 15-min-bucket provenance, T+1 freshness, `method` fallback meaning, how to join to `histdailyprice7` |
+| `doc/API-REFERENCE.md` | §7.1 event contract (`test`, `localrun`, `dbFlag`, `asof`-less, `sessions`-override shape); **§7.x new table reference** `histdailylevels` column table (marked "from DDL"); §7.5 `v_load_status` gains its line |
+| `TODOS.md` | §7.1 / §7.2 → status DONE, pointer to this plan + the handler |
+
+## II.9 Risks
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| **B1 wrong** (Volume semantics) → every VWAP wrong | Low (yfinance documents per-bar volume) but **high impact** | Phase II.0 gate: 3-symbol × 3-day verification query against live tables before any code |
+| 900 s timeout on a big scan window | Low-Medium (2.3 M rows pandas-side is fine; the risk is the SELECT) | One indexed `UTCDatetime >=` window read; if slow, chunk by exchange in the same run — measured in II.4's first invoke |
+| Asia bars mixed into a US session's grouping | Low | Grouping keys on `(Exchange, timezone)` — the fixture test L1 pins a mixed-exchange frame |
+| Half-day sessions look "sparse" → typical-price fallback fires | Expected, by design | `method` column records it; SR-Agent reads the flag, no data corruption |
+| `histminprice` gaps (61 stalled symbols, §8.9) → missing level rows | Certain for those symbols | By design: missing row, not wrong row; PRODUCT-GUIDE documents the non-uniform coverage |
+| New schedule collides with quota-10 concurrency | Negligible | One invocation/day at 21:30 ET, off-peak vs all other schedules |
+
+## II.10 Not in scope
+
+- **Back-filling** sessions before deploy (bars older than 60 days are gone upstream).
+- **Tick-level VWAP** — 15-min buckets are the best available upstream; `source` column leaves room for a future recompute.
+- **Asia enablement** — the handler processes Asia bars when they exist (06:00 ET run feeds the next morning's window), but a dedicated Asia-session schedule is deferred until the US path is proven.
+- **Greeks / options levels** — options chains remain in `OptionChains`; no per-strike profile.
+- **Any SR-Agent repo change** — the consumer reads the new table via its own extractor; its Stage-A DQ treats absent levels as `*_available = 0` (already spec'd in SR tech doc §4.6.4).

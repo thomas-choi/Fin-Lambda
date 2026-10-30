@@ -10,6 +10,8 @@ and the tables they write.
 
 ## Changelog
 
+- 2026-10-30 | Added | PART 2 — `histdailylevels` collector (TODOS §7): true bucket-Close VWAP + POC/VAH/VAL levels derived from the 15-min bars, `hist_levels_handler` contract, 21:30 ET schedule, `first_seen_at` availability, test plan (plan: `PLAN.md` Part II; ops: `doc/OPERATIONS.md` §10.5–10.6 additions).
+
 - 2026-10-12 | Modified | §6.1.1 `fx_snapshot_handler` reads a 5-day window and stamps each pair with its own last bar (`doc/OPERATIONS.md` §8.13).
 - 2026-10-12 | Modified | §6.6 `get_DBengine()` in the fin-deep-data fork now always connects over TLS (`DB_CONNECT_ARGS`), so a cold `caching_sha2_password` cache no longer needs `cryptography` (`doc/OPERATIONS.md` §8.11).
 - 2026-10-11 | Added | §6.1 five function rows and §6.1.1 — the five 2026-10-11 ports (FX snapshot, FFF, news, options snapshot, stock snapshot), their sources and what changed, and the one-transaction `replace_snapshot` write.
@@ -510,3 +512,155 @@ formats and e-mails, and a consumer that wants history queries the view
 **`histdailyprice7_shadow` / `OptionChains_shadow`** — `CREATE TABLE … LIKE` of
 the production tables, the write targets during the shadow run. The cutover is
 an env-var flip of `EOD_WRITE_TBL` / `OPT_WRITE_TBL`.
+
+---
+
+---
+
+# PART 2 — `histdailylevels` collector: daily VWAP + volume-profile levels (TODOS §7)
+
+Added: 2026-10-30 | Status: DRAFT (awaiting approval) | Plan: `PLAN.md` Part II (normative for phases, tests, phases gates) | Ops: `doc/OPERATIONS.md` §10.5 / §10.6 additions
+
+Planned **second** service increment of `fin-deep-data`: one new python3.13
+function (`histLevels`), one new companion table (`histdailylevels`), one new
+nightly schedule. It follows every mandatory rule: `dataUtil` is the only DB
+layer, writes go through `DU.append_ignore()` (INSERT IGNORE) + `audit_run` /
+`audit_summary`, the table is created owner-side by DDL script
+(`sql_require_primary_key=ON` — `to_sql` can never create it), pytest-mocked
+DB, zero outbound network calls.
+
+## 7.1 Purpose and consumer
+
+**TODOS §7.1** — true session **VWAP**: `Σ(price×vol) / Σ(vol)` over the
+15-minute buckets — **not** the `(H+L+C)/3` typical-price approximation
+(typical price is the *documented fallback*, used only when a session has
+< 80 % of expected buckets, with the method recorded per row).
+**TODOS §7.2** — volume-profile levels: **POC** (price bucket holding the max
+traded volume), **VAH / VAL** (70 % value-area bounds on a configurable
+close-price grid).
+
+Consumer: **SR-Agent** (downstream) — zone-strength features and the P2
+matched-control gate. Design constraints it imposes:
+
+- **Companion table, never new columns** on `histdailyprice7` — a missed day
+  is a *missing row*, not a NULL beside a real close. SR's Stage-A DQ treats
+  absent levels as `*_available = 0`.
+- **`available_at` exact** — SR binds `available_at <= as_of`; here it is the
+  row's `first_seen_at` (UTC, `DEFAULT CURRENT_TIMESTAMP(3)`) joined with the
+  job's `load_audit.finished_at` — the same pattern as `corp_action_daily`
+  (§7.4), whose `INSERT IGNORE`-first-sighting semantics make it an honest
+  availability timestamp.
+- One implementation upstream, every consumer reads the table (SR tech doc
+  §4.6.4 already reserves the feature slots).
+
+Both features derive **entirely from bars already collected** — the 15-minute
+bars in `histminprice` written by `yfus30minEODv2` (live, 20:05 ET) and
+`yfasia30minEODv2`. **yfinance is not called at all on the hot path** — no new
+upstream subscription, no quota interaction.
+
+## 7.2 Table: `GlobalMarketData.histdailylevels`
+
+New table; DDL in `Ops/fin-deep-data/sql/histdailylevels.sql`, **owner-run**,
+idempotent (`CREATE TABLE IF NOT EXISTS`). Grain: one row per
+(Symbol, Exchange, session) — `histminprice`'s own grain minus the clock.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `Date` | `DATE` | session date, exchange-local |
+| `Symbol` | `VARCHAR(45)` | yfinance ticker, as stored in `histminprice` |
+| `Exchange` | `VARCHAR(45)` | copied from the bars |
+| `vwap` | `DOUBLE` | Σ(Closeᵢ×Volᵢ)/Σ(Volᵢ); typical-price fallback when bucket coverage < 80 % |
+| `poc` | `DOUBLE` null | close-price bucket with max traded volume (NULL when the session span is < 60 min — see II.1 B3) |
+| `vah` | `DOUBLE` null | value-area high, `VA_RATIO` (default 0.70) of volume around POC |
+| `val` | `DOUBLE` null | value-area low |
+| `n_buckets` | `INT` | 15-min buckets actually used |
+| `bucket_size` | `INT` | price-bucket size used for POC/VA (cents grid; `0` when only VWAP computed) |
+| `method` | `VARCHAR(20)` | `vwap_bucketed` / `vwap_typical` — which path produced `vwap` |
+| `source` | `VARCHAR(20)` | `histminprice-15m` (provenance; a future tick-level recompute writes a different value) |
+| `first_seen_at` | `DATETIME(3)` | UTC, `DEFAULT CURRENT_TIMESTAMP(3)` — honest available-at |
+| `run_id` | `CHAR(26)` | `load_audit.run_id` of the computing run |
+
+Primary key `(Date, Symbol, Exchange)` — `DU.append_ignore()` (INSERT IGNORE)
+keeps the **first** computation of a session: a replay never changes history,
+the same idempotency contract as `corp_action_daily` and every historical
+table in this service. Joins on `Symbol` need no COLLATE (same charset as
+`histdailyprice7`).
+
+## 7.3 Function: `histLevels` (new python3.13 function)
+
+```mermaid
+flowchart TD
+    A["EventBridge<br/>21:30 ET Mon-Fri<br/>cron(30 21 ? * MON-FRI *)<br/>tz America/New_York"] --> W["run(event, context)<br/>dbFlag gate first"]
+    W --> S["symbols = current_symbols_V5 @type 'a'<br/>(expected-bucket counts only)"]
+    S --> M["ONE SELECT: bars from histminprice<br/>WHERE UTCDatetime >= (UTC now - 36h)<br/>via DU.load_df_SQL (PyMySQL, TLS)"]
+    M --> G["group by (Exchange, Symbol,<br/>session date from local Datetime)"]
+    G --> C["per group: n_buckets, span >= 60 min,<br/>coverage vs expected"]
+    C --> V["VWAP: bucket-Close weighted<br/>coverage >= 80% -> vwap_bucketed<br/>coverage < 80% -> vwap_typical"]
+    V --> P["volume profile on close-price grid:<br/>POC = argmax; expand to VAH/VAL<br/>until >= VA_RATIO (0.70)"]
+    P --> W2["append_ignore(histdailylevels)<br/>+ load_audit per-symbol + '*' summary<br/>job = 'histLevels'"]
+    W2 --> O["CSV: hist_levels_<asof>.csv<br/>(out_dir, always, dbFlag independent)"]
+```
+
+Contract (mirrors the historical-table handlers, §6.3):
+
+- **Window** — one scan: `UTCDatetime >= (UTC now − 36 h)`, no per-exchange
+  queries. ~2.3 M rows ≈ 350 MB in pandas — comfortably inside the 10 GB
+  and the 900 s timeout at pandas speed (measured analogue: intraday pair).
+  The grouping is pure pandas.
+- **Session derivation** — group by exchange-local `Datetime` (never
+  `UTCDatetime`); Asia bars in the same frame group into **their own**
+  sessions and are emitted the same way (no separate Asia schedule yet —
+  Part II §II.10).
+- **Expected buckets** — from the bars' own first/last bucket span
+  (span / 15 min); sessions with span < 60 min are skipped entirely
+  (II.1 B3) — the 60-min floor keeps the typical-price fallback honest.
+- **VWAP formula** — bucket **Close**-weighted (the best unbiased estimate
+  at 15-min granularity; H+L+C+L/4 biases high) — pinned by test L2.
+- **Write** — `DU.append_ignore()` on the PK (first wins), per-symbol
+  `load_audit` rows + one `'*'` summary under **job `histLevels`** (new data
+  set ⇒ its own job; no python3.10 predecessor, no cutover). `audit_run` /
+  `audit_summary` never raise (§6.6).
+- **Idempotence** — replay of the same session inserts 0 rows (PK collision)
+  and the audit still records the run; the CSV is always written.
+- **Config (env, all defaulted — `.env.example` updated same change)** —
+  `TBLDAILYLEVELS` (target table), `VA_RATIO` (0.70), `PROFILE_BUCKET`
+  (close-price grid in cents), `LEVELS_MIN_SPAN_MIN` (60),
+  `LEVELS_COVERAGE` (0.80). Read-only at runtime; absence falls back to the
+  documented defaults (test L9).
+- **Failure modes** — no bars → zero rows + `audit_summary(status='empty')`,
+  exit 0; partial session (half-day) → lower `n_buckets`, fallback may fire,
+  `method` records it; timeout → not expected (one window, no shards), the
+  II.4 first invoke measures it anyway.
+
+## 7.4 Deployment and operations
+
+Summarised here; procedures live in `doc/OPERATIONS.md` (§10.4/§10.4.1 flow,
+§10.5 schedule table, §10.6 dry-run shape).
+
+- **Function** — `histLevels`, handler `hist_levels_handler.run`, python3.13,
+  **coreLayer only** (`pandas`, `sqlalchemy`, `pymysql` — no yfinance layer).
+  Package patterns: `dataUtil.py`, `hist_levels_handler.py`. No layer rebuild —
+  a pure redeploy plus owner-run DDL.
+- **Schedule** — EventBridge `cron(30 21 ? * MON-FRI *)`, tz
+  `America/New_York`, **21:30 ET Mon–Fri**: after `yfus30minEODv2` (20:05 ET)
+  has landed the completed US session's bars. Ships `enabled: false` like
+  every schedule (deploy-safe; enabled only after the §10.4.1 manual-verify
+  flow). One invocation/day — no quota-10 interaction.
+- **statusReport** — one line added to `INFERRED_TABLES`
+  (`("DBMKTDATA", "TBLDAILYLEVELS", "histdailylevels", "Date")`); the report
+  then picks the table up the morning after enablement (21:30 is after the
+  20:00 statusReport — T+1 for the report, by design).
+
+## 7.5 Test plan
+
+Normative table: `PLAN.md` §II.7.3 (L1–L13) + §II.7.4 (non-unit
+verification). Shape: pure functions (`session_groups`, `bucket_vwap`,
+`volume_profile`, `value_area`, `fallback_typical`, `build_frame`) tested
+fixture-only; sqlite mirror of the DDL for the idempotency contract (test
+L11, the `test_dataUtil.py` pattern); `dbFlag=False` writes nothing but the
+CSV (L10); the autouse no-socket fixture holds (L13 — the module makes zero
+outbound calls). Existing 426-test suite must stay green; the new module
+passes the python3.13 warning gate (`-W error::FutureWarning:<module>`) per
+CLAUDE.md *Tests*.
+
+---

@@ -11,6 +11,8 @@ parses. Those *are* its API.
 
 ## Changelog
 
+- 2026-10-30 | Added | §7.6.2 — `histdailylevels` column reference (planned, from the planned DDL: `PLAN.md` Part II / TODOS §7): grain, `append_ignore` first-wins idempotency, `first_seen_at` availability, read recipe.
+
 - 2026-10-12 | Modified | §7.1 `FX_snapshot.last_updated` is now each pair's own last bar, not the run's newest bar.
 - 2026-10-12 | Modified | §7.2 `get_DBengine()` (fin-deep-data) always connects over TLS; new module constant `DB_CONNECT_ARGS`.
 - 2026-10-11 | Added | §7.1 event contracts, return values, `load_audit` summary shapes and written columns of the five ports (FXrateHandlerv2, fffHandlerv2, yfNewshandlerv2, optHandlerv2, cronHandlerv2).
@@ -574,6 +576,38 @@ In the handler, `reshape_bars()` leaves `UTCDatetime` tz-aware in the frame whil
 offset is dropped on the way in and the stored value is that UTC wall time. A
 dry-run CSV therefore goes through `_as_stored()`, which strips it, so the file
 shows what a `SELECT` returns.
+
+### 7.6.2 `histdailylevels` (planned — TODOS §7 / PLAN Part II)
+
+> **Status: not yet built.** DDL will live in `Ops/fin-deep-data/sql/histdailylevels.sql`
+> (owner-run, idempotent). Columns below are **from the planned DDL**, not read
+> off a live table.
+
+Written by the planned `histLevels` function via `DU.append_ignore()`
+(INSERT IGNORE — the first computation of a session wins; a replay never
+changes history), in this order:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `Date` | `DATE` | session date, exchange-local |
+| `Symbol` | `VARCHAR(45)` | yfinance ticker, as stored in `histminprice` |
+| `Exchange` | `VARCHAR(45)` | copied from the bars |
+| `vwap` | `DOUBLE` | Σ(Closeᵢ×Volᵢ)/Σ(Volᵢ) over the session's 15-min buckets; typical-price fallback when coverage < `LEVELS_COVERAGE` |
+| `poc` | `DOUBLE` null | close-price bucket with max traded volume; NULL when session span < `LEVELS_MIN_SPAN_MIN` |
+| `vah` | `DOUBLE` null | value-area high, `VA_RATIO` of volume around POC |
+| `val` | `DOUBLE` null | value-area low |
+| `n_buckets` | `INT` | 15-min buckets actually used |
+| `bucket_size` | `INT` | price-bucket size used for the profile (0 when only VWAP computed) |
+| `method` | `VARCHAR(20)` | `vwap_bucketed` / `vwap_typical` |
+| `source` | `VARCHAR(20)` | `histminprice-15m` |
+| `first_seen_at` | `DATETIME(3)` | UTC, `DEFAULT CURRENT_TIMESTAMP(3)` — honest available-at (the `corp_action_daily` pattern) |
+| `run_id` | `CHAR(26)` | `load_audit.run_id` of the computing run |
+
+Primary key `(Date, Symbol, Exchange)`. Reads: join to `histdailyprice7` on
+`(Date, Symbol)`; a missing row is absence, never a zero or a stale value.
+`v_load_status` gains a `(histdailylevels, histLevels)` line once the function
+is deployed (§7.5 view); the planned event contract is `{"dbFlag": false}` for
+dry runs plus a `test` symbol cap, matching §7.1's shape.
 
 ### 7.7 R2 key layout
 

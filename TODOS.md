@@ -143,6 +143,21 @@ that change.
 
 ---
 
+## 7. Data-collection requests from SR-Agent (downstream feature requests)
+
+> Opened 2026-10-29. The SR-Agent consumes the MySQL tables this service writes;
+> its zone-scoring features (tech doc §4.6, families C/D) need two level types
+> the collectors do not yet materialise. Owner approved adding the item
+> 2026-10-29; nothing here blocks the SR-Agent Stage-A read layer (it extracts
+> what exists today and treats the new columns as absent → DQ `*_available = 0`).
+
+| # | Request | Source data | Notes | Status |
+|---|---|---|---|---|
+| 7.1 | **Daily VWAP per symbol-session** for the EOD universe (at minimum the options underlyings + V4/V5 list). True session VWAP (Σ price×vol / Σ vol), not the `(H+L+C)/3` typical-price approximation. Store as a `histdailyprice7` companion table (e.g. `histdailylevels`: `Date, Symbol, vwap, n_buckets, source`) rather than new columns, so a missed day is a missing row, not a null beside a real close | `histminprice` 15-min bars the service already collects (US + Asia) — aggregate per symbol-session; fall back to typical-price only if a session has < 80 % of expected buckets, and record which method was used | yfinance offers no tick/VWAP endpoint, so bucket aggregation is the best available upstream; 15-min buckets are a good approximation for daily-bar research (SR-Agent uses it as a zone-strength feature, not execution). SR-Agent consumes via its nightly MySQL extract; `available_at` = `load_audit.finished_at` of the new job | TODO |
+| 7.2 | **Daily volume-profile levels per symbol-session**: POC (price bucket with max traded volume), VAH/VAL (70 % value-area bounds) computed from the same 15-min buckets, same companion table (`poc, vah, val, bucket_size`). Same caveats as 7.1: bucket approximation, method recorded per row | Same as 7.1 — one job can emit both (7.1 + 7.2 share the aggregation pass) | SR-Agent uses POC/VAH/VAL as zone candidates + the matched-control experiment (its P2 gate); keeping the computation upstream means one implementation for every consumer | TODO |
+
+---
+
 ## Suggested order
 
 1. Section 0 (scaffolding) — one sitting, unblocks everything.
